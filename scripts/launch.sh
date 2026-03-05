@@ -3,6 +3,8 @@
 #
 # 用法:
 #   launch.sh [选项]
+#   launch.sh --find          查找当前运行的展板实例并打印 URL
+#   launch.sh --stop          停止当前运行的展板实例
 #
 # 选项:
 #   --port <PORT>           展板端口，默认 7789
@@ -13,6 +15,9 @@
 #   --no-ai                 禁用 AI 分析
 #   --bg                    后台运行（不阻塞终端）
 #   --open                  启动后自动打开浏览器
+#
+# 启动后 URL 写入 /tmp/wt-dashboard.url（固定路径，无论用哪个端口）
+# 任何时候 cat /tmp/wt-dashboard.url 即可找到展板地址
 #
 # 示例（默认配置，直接用自建代理 gemini-2.5-flash）:
 #   launch.sh --bg --open
@@ -34,6 +39,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DASHBOARD_PY="$SCRIPT_DIR/../dashboard.py"
+URL_FILE="/tmp/wt-dashboard.url"   # 固定路径，任何时候 cat 都能找到
 
 PORT=7789
 LOGS=()
@@ -43,6 +49,38 @@ LLM_MODEL=""
 NO_AI=0
 BG=0
 OPEN_BROWSER=0
+
+# ── --find / --stop 快捷命令 ────────────────────────
+if [[ "${1:-}" == "--find" ]]; then
+  if [[ -f "$URL_FILE" ]]; then
+    URL=$(cat "$URL_FILE")
+    # 验证进程还活着
+    PID_FILE="/tmp/wt-dashboard.pid"
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "✅ 展板运行中: $URL  (PID=$(cat $PID_FILE))"
+    else
+      echo "⚠  URL 文件存在但进程已死: $URL"
+      echo "   重新启动: launch.sh --bg --open"
+    fi
+  else
+    echo "❌ 没有找到运行中的展板（$URL_FILE 不存在）"
+    echo "   启动: launch.sh --bg --open"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--stop" ]]; then
+  PID_FILE="/tmp/wt-dashboard.pid"
+  if [[ -f "$PID_FILE" ]]; then
+    PID=$(cat "$PID_FILE")
+    kill "$PID" 2>/dev/null && echo "✅ 已停止 PID=$PID" || echo "⚠ 进程已不存在"
+    rm -f "$PID_FILE" "$URL_FILE"
+  else
+    pkill -f "dashboard.py" 2>/dev/null && echo "✅ 已停止" || echo "❌ 没有找到运行中的展板"
+    rm -f "$URL_FILE"
+  fi
+  exit 0
+fi
 
 # ── 解析参数 ────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -77,18 +115,19 @@ CMD=(python3 "$DASHBOARD_PY" --port "$PORT")
 [[ -n "$LLM_MODEL"    ]] && CMD+=(--llm-model     "$LLM_MODEL")
 [[ $NO_AI -eq 1       ]] && CMD+=(--no-ai)
 
-echo "[launch] 展板地址: http://localhost:$PORT"
-echo "[launch] 命令: ${CMD[*]}"
+DASHBOARD_URL="http://localhost:$PORT"
+echo "[launch] 展板地址: $DASHBOARD_URL"
+echo "$DASHBOARD_URL" > "$URL_FILE"   # 写入固定路径
 
 # ── 启动 ────────────────────────────────────────────
 if [[ $OPEN_BROWSER -eq 1 ]]; then
-  # 延迟1秒再开浏览器，等端口就绪
-  (sleep 1 && cmd.exe /c start "http://localhost:$PORT" 2>/dev/null || \
-              xdg-open "http://localhost:$PORT" 2>/dev/null || true) &
+  (sleep 1 && cmd.exe /c start "$DASHBOARD_URL" 2>/dev/null || \
+              xdg-open "$DASHBOARD_URL" 2>/dev/null || true) &
 fi
 
+PID_FILE="/tmp/wt-dashboard.pid"
+
 if [[ $BG -eq 1 ]]; then
-  PID_FILE="/tmp/wt-dashboard-$PORT.pid"
   # 若已有实例在跑，先杀掉
   if [[ -f "$PID_FILE" ]]; then
     OLD_PID=$(cat "$PID_FILE")
@@ -97,8 +136,12 @@ if [[ $BG -eq 1 ]]; then
     sleep 0.3
   fi
   nohup "${CMD[@]}" > "/tmp/wt-dashboard-$PORT.log" 2>&1 &
-  echo $! > "$PID_FILE"
-  echo "[launch] 后台运行 PID=$(cat $PID_FILE)，日志: /tmp/wt-dashboard-$PORT.log"
+  NEW_PID=$!
+  echo $NEW_PID > "$PID_FILE"
+  echo "[launch] 后台运行 PID=$NEW_PID  cat $URL_FILE 随时查地址"
 else
+  # 前台运行：退出时清理 URL 文件
+  trap "rm -f '$URL_FILE' '$PID_FILE'" EXIT
+  echo $$ > "$PID_FILE"
   "${CMD[@]}"
 fi

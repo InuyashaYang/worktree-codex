@@ -145,8 +145,18 @@ def parse_log(path: str) -> dict:
 
     name_m    = re.search(r"\] (\S+) starting", text)
     name      = name_m.group(1) if name_m else Path(path).stem
-    exit_m    = re.search(r"\] \S+ codex exited with code (\d+)", text)
-    exit_code = int(exit_m.group(1)) if exit_m else None
+    # exit code：优先从 ##CODEX_EXIT## / ##AGENT_DONE## 标记读，其次老格式
+    codex_exit_m = re.search(r'##CODEX_EXIT##[^\n]*code=(\d+)', text)
+    agent_done_m = re.search(r'##AGENT_DONE##[^\n]*exit_code=(\d+)', text)
+    exit_m       = re.search(r'\] \S+ codex exited with code (\d+)', text)
+    if codex_exit_m:
+        exit_code = int(codex_exit_m.group(1))
+    elif agent_done_m:
+        exit_code = int(agent_done_m.group(1))
+    elif exit_m:
+        exit_code = int(exit_m.group(1))
+    else:
+        exit_code = None
 
     tokens_m   = re.search(r"tokens used\s*\n([\d,]+)", text)
     tokens     = int(tokens_m.group(1).replace(",", "")) if tokens_m else None
@@ -884,8 +894,30 @@ def main():
     else:
         print(f"[dashboard] AI 分析: {LLM_CFG['model']} @ {LLM_CFG['base_url']}")
 
+    URL = f"http://localhost:{args.port}"
+    URL_FILE = "/tmp/wt-dashboard.url"
+
+    # 写固定路径，让任何脚本/AI 都能 cat 到当前展板地址
+    try:
+        with open(URL_FILE, "w") as f:
+            f.write(URL + "\n")
+    except Exception:
+        pass
+
+    print(f"[dashboard] ✅ 展板已启动: {URL}")
+    print(f"[dashboard] 地址文件:    {URL_FILE}  (cat 随时查)")
+
     server = HTTPServer(("", args.port), Handler)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        # 前台退出时清理 URL 文件
+        try:
+            import os as _os
+            if open(URL_FILE).read().strip() == URL:
+                _os.unlink(URL_FILE)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
