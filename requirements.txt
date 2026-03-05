@@ -1,0 +1,16 @@
+# worktree-codex — Python dependencies
+
+# dashboard.py AI 分析模块
+httpx>=0.24.0
+
+# 标准库（仅作文档用，无需安装）
+# argparse, json, os, re, threading, time, glob, pathlib
+# http.server, socketserver
+
+# 系统级依赖（需预装）
+# git >= 2.x            — worktree 操作
+# bash >= 4.x           — 所有 .sh 脚本
+# codex CLI             — npm install -g @openai/codex
+#   或 Claude Code CLI  — https://github.com/anthropics/claude-code
+# gh CLI (可选)         — push_and_pr.sh PR 创建
+# python3 >= 3.8

@@ -9,12 +9,12 @@
 #   --logs <glob/path>...   初始 log 文件（可 glob，可多个），后续 agent 自动注册
 #   --llm-base-url <URL>    AI 分析 base URL，默认 http://YOUR_PROXY_HOST:PORT/v1（自建代理）
 #   --llm-api-key <KEY>     AI 分析 API Key，默认从环境变量 OPENAI_API_KEY 读取
-#   --llm-model <MODEL>     AI 分析模型，默认 step-3.5-flash；多模态用 qwen3-30b-vl
+#   --llm-model <MODEL>     AI 分析模型，默认 gemini-2.5-flash；多模态用 qwen3-30b-vl
 #   --no-ai                 禁用 AI 分析
 #   --bg                    后台运行（不阻塞终端）
 #   --open                  启动后自动打开浏览器
 #
-# 示例（默认配置，直接用自建代理 step-3.5-flash）:
+# 示例（默认配置，直接用自建代理 gemini-2.5-flash）:
 #   launch.sh --bg --open
 #
 # 示例（多模态分析任务）:

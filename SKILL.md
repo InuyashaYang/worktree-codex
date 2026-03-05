@@ -57,8 +57,17 @@ Task prompt 模板：
 ```
 你是 <AgentName>，只能修改 <file1>, <file2>，不得碰其他文件。
 任务：<具体实现要求，含函数签名、异常处理、docstring>
-完成后执行：git add -A && git commit -m "<commit message>"
-只输出 done。
+
+**可解释性协议（必须遵守）：**
+在执行过程中，在关键节点输出以下格式的标记行（独立成行）：
+
+  ##INTENT## 我接下来要做什么，以及为什么
+  ##OBSTACLE## 遇到了什么预期外的问题
+  ##DECISION## 我选择了方案X而不是方案Y，原因是Z
+  ##RESULT## 最终完成了什么，核心改动是什么（一句话）
+
+要求：每个主要阶段至少一个 ##INTENT##，遇到问题必须输出 ##OBSTACLE##，完成时必须输出 ##RESULT##。
+完成后执行：git add -A && git commit -m "[<AgentName>] task complete"
 ```
 
 ### 步骤 4：启动展板（可选但推荐）

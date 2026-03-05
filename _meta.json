@@ -1,0 +1,8 @@
+{
+  "slug": "worktree-codex",
+  "version": "1.0.0",
+  "description": "Parallel Codex/Claude Code orchestrator using git worktrees with real-time dashboard and LLM efficiency analysis.",
+  "author": "InuyashaYang",
+  "tags": ["codex", "parallel", "git-worktree", "dashboard", "orchestration"],
+  "publishedAt": null
+}

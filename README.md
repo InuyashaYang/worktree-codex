@@ -38,7 +38,7 @@ bash scripts/setup_worktrees.sh <repo_dir> <worktrees_base_dir> agent-a agent-b
 ### 2. 启动展板
 
 ```bash
-# 默认：step-3.5-flash，key 从环境变量 OPENAI_API_KEY 读
+# 默认：gemini-2.5-flash，key 从环境变量 OPENAI_API_KEY 读
 bash scripts/launch.sh --bg --open
 
 # 指定模型和端点
@@ -94,7 +94,7 @@ bash scripts/push_and_pr.sh \
 | `--logs` | 无 | 初始 log 路径（可 glob，后续 agent 自动注册） |
 | `--llm-base-url` | `http://YOUR_PROXY_HOST:PORT/v1` | AI 分析 LLM 端点 |
 | `--llm-api-key` | 环境变量 `OPENAI_API_KEY` | AI 分析 API Key |
-| `--llm-model` | `step-3.5-flash` | AI 分析模型；多模态用 `qwen3-30b-vl` |
+| `--llm-model` | `gemini-2.5-flash` | AI 分析模型；多模态用 `qwen3-30b-vl` |
 | `--no-ai` | — | 禁用 AI 分析 |
 | `--bg` | — | 后台运行 |
 | `--open` | — | 自动打开浏览器 |
