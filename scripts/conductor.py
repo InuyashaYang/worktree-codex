@@ -863,9 +863,15 @@ class Conductor:
     # ── 检查 agent 是否满足启动条件 ───────────────────────────────────
 
     def _can_start(self, name: str) -> bool:
-        """检查 agent 的所有依赖是否已 pass"""
+        """检查 agent 的所有依赖是否已 pass；若有上游 fail 则直接传播 fail"""
         a = self.agents_map[name]
         for dep in (a.get("depends") or []):
+            if dep in self.failed:
+                # 上游 fail → 下游不可能启动，立即传播
+                self._emit("ERROR", f"agent={name} 上游依赖 {dep} 已失败，跳过")
+                self.status[name] = "fail"
+                self.failed.add(name)
+                return False
             if dep not in self.passed:
                 return False
         return True
@@ -971,11 +977,13 @@ class Conductor:
         elapsed = round(time.time() - self.start_time, 1)
         pass_count = len(self.passed)
         fail_count = len(self.failed)
-        total_rounds = max(self.agent_rounds.values()) if self.agent_rounds else 0
+        # 各 agent 追问轮次汇总（每个 agent 独立计）
+        max_rounds = max(self.agent_rounds.values()) if self.agent_rounds else 0
+        total_rounds_sum = sum(self.agent_rounds.values())
 
         self._emit(
             "CONDUCTOR_DONE",
-            f"pass={pass_count} fail={fail_count} rounds={total_rounds} elapsed={elapsed}s",
+            f"pass={pass_count} fail={fail_count} max_rounds={max_rounds} total_inject_rounds={total_rounds_sum} elapsed={elapsed}s",
         )
 
         # 写报告文件
@@ -985,7 +993,7 @@ class Conductor:
                 f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"仓库: {self.repo}\n")
                 f.write(f"CONTRACT: {self.contract}\n")
-                f.write(f"总轮数: {total_rounds}  耗时: {elapsed}s\n\n")
+                f.write(f"总追问轮: {total_rounds_sum} (最多单 agent {max_rounds} 轮)  耗时: {elapsed}s\n\n")
                 f.write("## Agent 状态汇总\n")
                 f.write(f"通过: {pass_count}  失败: {fail_count}  总计: {n_agents}\n\n")
                 f.write("| Agent | 状态 | 追问轮次 |\n")
