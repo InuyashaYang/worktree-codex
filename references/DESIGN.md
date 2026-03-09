@@ -345,3 +345,120 @@ orchestrate.sh 新增：
 | 等待机制 | 轮询 log 文件行数 | AGENT_DONE 是结构化标记，稳定可靠；避免进程间 pipe |
 | 追问超时 | Phase 0 超时 30min，Phase 3 超时 15min | 追问任务应比初始任务快，给更短的窗口 |
 | CONTRACT 格式 | Markdown + awk 解析 | 人类可读，AI 可直接生成，无需 JSON/YAML schema |
+
+---
+
+## 七、异步事件循环架构（conductor.py v2）
+
+### 7.1 与旧架构对比
+
+| 维度 | v1（conductor.sh） | v2（conductor.py） |
+|------|-------------------|-------------------|
+| 调度模型 | 批处理：等所有人完成再验证 | 事件循环：单 Agent 完成即验证 |
+| 并发控制 | 无上限（全部同时启动） | slot 池（默认 max=5） |
+| 任务依赖 | 无（全并行，口头约定） | DAG（Kahn 算法拓扑排序） |
+| 上游信息传递 | 无（下游靠假设） | `{{agent-name}}` 占位符→实际文件摘要 |
+| 追问时机 | 批次结束后 | 验证失败后立即注入 |
+| 任务描述 | CLI `--agents` 字符串 | `tasks.yaml` 结构化文件 |
+| 实现语言 | Bash | Python（标准库） |
+| 展板集成 | 无 slot/dag | `/tmp/wt-conductor-state.json` → SSE 帧 |
+
+### 7.2 事件循环伪代码
+
+```
+初始化：
+  topo_order = kahn_sort(agents)        # 拓扑排序
+  status = {a: "waiting" for a in agents}
+  running_procs = {}                     # name → Popen
+  passed = set()
+
+主循环（每 poll_interval 秒）：
+
+  # 检查正在运行的 Agent
+  for name in list(running_procs):
+    if agent_done_detected(name):        # 检测 log 中新出现的 AGENT_DONE
+      status[name] = "verifying"
+      ok, failures = verify(name)        # 语法检查 + CONTRACT 验证
+      if ok:
+        status[name] = "pass"
+        passed.add(name)
+        free_slot(name)                  # 释放 slot
+        unlock_downstream(name)          # 解锁依赖此 Agent 的下游
+      else:
+        status[name] = "inject"
+        write_inject(name, failures)     # 写追问文件（保持 slot 占用）
+
+    elif status[name] == "inject" and inject_consumed(name):
+      status[name] = "running"          # inject 已被消费，等下次 AGENT_DONE
+
+  # 启动可运行的等待任务
+  for name in topo_order:
+    if status[name] != "waiting": continue
+    if not all(d in passed for d in depends[name]): continue  # 依赖未通过
+    if len(running_procs) >= max_slots: break                  # slot 已满
+    fork_agent(name)                    # 注入上游摘要，fork orchestrate.sh
+    status[name] = "running"
+
+  write_state_file()                    # 供 dashboard 读取
+
+  if all(s in ("pass","fail") for s in status.values()):
+    break
+
+输出最终报告
+```
+
+### 7.3 DAG 拓扑排序（Kahn 算法）
+
+```python
+in_degree = {a: 0 for a in agents}
+children = defaultdict(list)
+for a in agents:
+    for dep in a.depends:
+        children[dep].append(a.name)
+        in_degree[a.name] += 1
+
+queue = deque(n for n, d in in_degree.items() if d == 0)
+order = []
+while queue:
+    node = queue.popleft()
+    order.append(node)
+    for child in children[node]:
+        in_degree[child] -= 1
+        if in_degree[child] == 0:
+            queue.append(child)
+
+if len(order) != len(agents):
+    raise ValueError("循环依赖！")
+```
+
+检测到循环依赖时直接报错退出，不允许进入调度循环。
+
+### 7.4 slot 池设计
+
+- `running_procs: Dict[str, Popen]`：记录当前占用 slot 的 Agent
+- slot 释放时机：**仅在 pass 时释放**；inject 期间 slot 继续占用
+- slot 状态写入 `/tmp/wt-conductor-state.json`，dashboard SSE 帧附带推送
+
+### 7.5 `{{upstream}}` 注入机制
+
+启动下游 Agent 时，conductor 扫描 prompt 中的 `{{dep-name}}` 占位符：
+
+```python
+for dep_name in agent.depends:
+    placeholder = "{{" + dep_name + "}}"
+    if placeholder in prompt:
+        summary = read_files(dep_cfg.worktree, dep_cfg.files, max_lines=150)
+        prompt = prompt.replace(placeholder, summary)
+```
+
+**效果：** 下游 Agent 拿到的 prompt 里包含上游的真实代码，而不是预先假设的接口描述。这从根本上解决了多 Agent 接口不匹配问题（如之前的 `pieces[row][col]` vs `pieces[col][row]`）。
+
+**CONTRACT 的角色变化：** 有了 `{{upstream}}` 注入后，CONTRACT 主要作为验证基准（conductor 验证 Agent 是否导出了约定的符号），不再是唯一的接口对齐手段。
+
+### 7.6 tasks.yaml 格式
+
+参见 `scripts/tasks_template.yaml`，支持：
+- 全局配置：`repo`, `contract`, `worktrees_base`, `syntax_check`, `max_slots`, `dashboard_port`
+- Agent 列表：`name`, `files`, `depends`, `log`, `branch`, `worktree`, `prompt`
+- 多行 prompt 块（YAML `|` 语法）
+- `{{dep-name}}` 占位符

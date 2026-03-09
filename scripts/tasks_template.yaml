@@ -1,0 +1,145 @@
+# tasks_template.yaml — worktree-codex 任务描述模板
+#
+# 用法：
+#   python3 scripts/conductor.py --tasks tasks.yaml
+#
+# 所有路径支持绝对路径或相对于本文件的相对路径。
+# YAML 解析优先 PyYAML，无则用内置 mini-parser（支持 list/dict/string/多行块 |）。
+
+# ── 全局配置 ─────────────────────────────────────────────────────────
+
+# Git 仓库根目录（必填）
+repo: /home/user/projects/my-project
+
+# CONTRACT.md 路径（必填，用于验证 Agent 导出符号）
+contract: /home/user/projects/my-project/CONTRACT.md
+
+# worktree 基础目录（必填，各 Agent 的 worktree 将在此目录下创建）
+worktrees_base: /home/user/projects/my-project-worktrees
+
+# 语法检查命令（可选，为空则跳过；css/html/md 自动跳过）
+syntax_check: "node --check"
+
+# 最大并发 slot 数（默认 5）
+max_slots: 5
+
+# 展板端口（默认 7789）
+dashboard_port: 7789
+
+# ── Agent 列表 ───────────────────────────────────────────────────────
+#
+# 每个 Agent 字段说明：
+#   name:     Agent 名称（必须与 CONTRACT.md 里的 "## Agent: <name>" 一致）
+#   files:    该 Agent 负责的文件列表（相对 worktree 根）
+#   depends:  依赖的上游 Agent 名称列表（空列表或省略=无依赖，立即启动）
+#   log:      log 文件路径（conductor 监听此文件检测 AGENT_DONE）
+#   branch:   git branch 名称（由 setup_worktrees.sh 创建）
+#   worktree: worktree 目录路径（由 setup_worktrees.sh 创建）
+#   prompt:   传给 orchestrate.sh 的任务 prompt（支持多行块 |）
+#             可用占位符：{{dep-name}} → 替换为上游 Agent 的实际文件摘要（前150行）
+#             占位符只在 depends 中的上游验证通过后才有效
+
+agents:
+
+  # ── 示例 1：单层并行（3 Agent，无依赖） ─────────────────────────
+
+  - name: agent-logic
+    files: [logic.js]
+    depends: []
+    log: /tmp/wt-agent-logic.log
+    branch: feature/agent-logic-YYYYMMDD-xxxx   # 由 setup_worktrees.sh 生成
+    worktree: /home/user/projects/my-project-worktrees/agent-logic
+    prompt: |
+      你是 agent-logic，只能创建和修改 logic.js。
+      任务：实现业务逻辑模块...
+      完成后 git add -A && git commit -m "[agent-logic] task complete"
+
+  - name: agent-ui
+    files: [index.html, ui.js]
+    depends: []
+    log: /tmp/wt-agent-ui.log
+    branch: feature/agent-ui-YYYYMMDD-xxxx
+    worktree: /home/user/projects/my-project-worktrees/agent-ui
+    prompt: |
+      你是 agent-ui，只能创建和修改 index.html, ui.js。
+      任务：实现 UI 交互层...
+      完成后 git add -A && git commit -m "[agent-ui] task complete"
+
+  - name: agent-style
+    files: [style.css]
+    depends: []
+    log: /tmp/wt-agent-style.log
+    branch: feature/agent-style-YYYYMMDD-xxxx
+    worktree: /home/user/projects/my-project-worktrees/agent-style
+    prompt: |
+      你是 agent-style，只能创建和修改 style.css。
+      任务：实现样式...
+      完成后 git add -A && git commit -m "[agent-style] task complete"
+
+# ── 示例 2：DAG 依赖链（4 Agent，有串行依赖） ──────────────────────
+#
+# DAG 结构：
+#   agent-db ──┐
+#              ↓
+#   agent-auth → agent-api → agent-frontend
+#
+# agent-api 等 agent-db 和 agent-auth 都通过验证后才启动，
+# 并且 prompt 中可用 {{agent-db}} 和 {{agent-auth}} 获取上游实际产出。
+
+# agents:
+#
+#   - name: agent-db
+#     files: [db/schema.js, db/queries.js]
+#     depends: []
+#     log: /tmp/wt-agent-db.log
+#     branch: feature/agent-db-xxx
+#     worktree: /path/to/worktrees/agent-db
+#     prompt: |
+#       你是 agent-db，只能修改 db/schema.js 和 db/queries.js。
+#       任务：实现数据库访问层...
+#       完成后 git add -A && git commit -m "[agent-db] task complete"
+#
+#   - name: agent-auth
+#     files: [auth/middleware.js]
+#     depends: []
+#     log: /tmp/wt-agent-auth.log
+#     branch: feature/agent-auth-xxx
+#     worktree: /path/to/worktrees/agent-auth
+#     prompt: |
+#       你是 agent-auth，只能修改 auth/middleware.js。
+#       任务：实现认证中间件...
+#       完成后 git add -A && git commit -m "[agent-auth] task complete"
+#
+#   - name: agent-api
+#     files: [api/routes.js]
+#     depends: [agent-db, agent-auth]   # 等两个上游都通过验证
+#     log: /tmp/wt-agent-api.log
+#     branch: feature/agent-api-xxx
+#     worktree: /path/to/worktrees/agent-api
+#     prompt: |
+#       你是 agent-api，只能修改 api/routes.js。
+#       任务：实现 REST API 路由层。
+#
+#       ## agent-db 实际产出（已验证）
+#       {{agent-db}}
+#
+#       ## agent-auth 实际产出（已验证）
+#       {{agent-auth}}
+#
+#       基于以上实际接口实现路由层，不要假设接口。
+#       完成后 git add -A && git commit -m "[agent-api] task complete"
+#
+#   - name: agent-frontend
+#     files: [frontend/app.js]
+#     depends: [agent-api]
+#     log: /tmp/wt-agent-frontend.log
+#     branch: feature/agent-frontend-xxx
+#     worktree: /path/to/worktrees/agent-frontend
+#     prompt: |
+#       你是 agent-frontend，只能修改 frontend/app.js。
+#
+#       ## agent-api 实际产出（已验证）
+#       {{agent-api}}
+#
+#       基于以上 API 接口实现前端交互。
+#       完成后 git add -A && git commit -m "[agent-frontend] task complete"

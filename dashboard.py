@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-worktree-codex 实时监控展板 v1.1
+worktree-codex 实时监控展板 v1.2
+- 新增: conductor-state.json 读取 → SSE 帧附带 slots/dag 数据
+- 新增: Slot 状态栏（N 个方块，running/waiting/done/failed/empty）
+- 新增: DAG 面板（CSS flexbox 依赖图）
+- 以下为原有功能（保持不变）：
 - 任务生命周期绑定：idle 保持页面，/register 追加 agent，/reload 重置
 - 规则式解析：tokens / elapsed / diff stat / turns / retries / session_id / shell cmds
 - 甘特图时间线（所有 agent 横向对比）
@@ -246,6 +250,26 @@ def collect_stats(agents):
             "time_saved": saved}
 
 # ──────────────────────────────────────────────
+# conductor 状态读取（slots + DAG）
+# ──────────────────────────────────────────────
+
+_CONDUCTOR_STATE_FILE = "/tmp/wt-conductor-state.json"
+
+def read_conductor_state() -> dict:
+    """
+    读取 conductor.py 写入的状态文件。
+    文件不存在时返回 None（向后兼容），dashboard SSE 帧里 slots/dag 字段为 null。
+    """
+    if not os.path.isfile(_CONDUCTOR_STATE_FILE):
+        return None
+    try:
+        with open(_CONDUCTOR_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────
 # gemini-2.5-flash 智能分析（后台线程，失败静默）
 # ──────────────────────────────────────────────
 
@@ -476,6 +500,33 @@ header h1 { font-size: 15px; color: #58a6ff; white-space: nowrap; }
 #ai-box h3 { font-size: 12px; color: #58a6ff; margin-bottom: 8px; }
 #ai-content { font-size: 12px; color: #c9d1d9; white-space: pre-wrap; line-height: 1.7; }
 #ai-loading { color: #8b949e; font-size: 11px; }
+
+/* Slot 状态栏 */
+#slots { margin: 12px 16px 0; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+#slots h3 { font-size: 12px; color: #58a6ff; margin-bottom: 10px; }
+.slot-row { display: flex; gap: 4px; align-items: center; margin-bottom: 4px; }
+.slot-label { font-size: 11px; color: #8b949e; width: 60px; flex-shrink: 0; }
+.slot-grid { display: flex; gap: 6px; flex-wrap: wrap; }
+.slot-cell { min-width: 52px; height: 24px; border-radius: 4px; flex-shrink: 0; font-size: 10px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 4px; cursor:default; }
+.slot-running { background: #1f6feb; animation: pulse 1.5s infinite; }
+.slot-waiting { background: #30363d; color:#8b949e; }
+.slot-done { background: #238636; }
+.slot-failed { background: #da3633; }
+.slot-empty { background: #21262d; color:#484f58; }
+
+/* DAG 面板 */
+#dag { margin: 12px 16px 0; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+#dag h3 { font-size: 12px; color: #58a6ff; margin-bottom: 10px; }
+.dag-grid { display: flex; flex-wrap: wrap; gap: 12px; }
+.dag-node { padding: 8px 12px; border-radius: 6px; border: 2px solid #30363d; font-size: 11px; text-align: center; flex-shrink: 0; background: #0d1117; min-width: 64px; }
+.dag-node-name { font-weight: bold; color: #e6edf3; margin-bottom: 2px; }
+.dag-node-status { font-size: 10px; }
+.dag-node-running { background: #1f6feb; color: #fff; }
+.dag-node-waiting { background: #30363d; color: #8b949e; }
+.dag-node-done { background: #238636; color: #fff; }
+.dag-node-failed { background: #da3633; color: #fff; }
+.dag-edge { height: 1px; background: #30363d; margin: 0 6px; flex-shrink: 0; }
+
 footer { text-align: center; padding: 8px; color: #30363d; font-size: 11px; }
 </style>
 </head>
@@ -486,6 +537,8 @@ footer { text-align: center; padding: 8px; color: #30363d; font-size: 11px; }
   <div id="time-saved"></div>
 </header>
 <div id="idle-banner">⏸ 任务已完成，等待下次任务… 页面不失效</div>
+<div id="slots"><h3>🔄 Slot 状态栏</h3><div class="slot-row"><span class="slot-label">Slots:</span><div class="slot-grid" id="slot-grid"></div></div></div>
+<div id="dag"><h3>📋 DAG 依赖图</h3><div class="dag-grid" id="dag-grid"></div></div>
 <div id="gantt"><h3>📊 时间线</h3><div id="gantt-rows"></div></div>
 <div id="agents"></div>
 <div id="ai-box">
@@ -710,6 +763,8 @@ function connect() {
       document.getElementById('time-saved').textContent = renderTimeSaved(data.stats);
       document.getElementById('idle-banner').style.display = data.mode==='idle' ? 'block' : 'none';
       renderGantt(data.agents);
+      renderSlots(data.slots || null);
+      renderDag(data.dag || null);
       const c = document.getElementById('agents');
       data.agents.forEach(a => {
         const ex = document.getElementById('card-' + a.name);
@@ -742,6 +797,67 @@ function connect() {
   };
 }
 connect();
+
+// ── Slot 状态栏渲染 ──────────────────────────────────────────────────
+function renderSlots(slots) {
+  const grid = document.getElementById('slot-grid');
+  if (!grid || !slots) return;
+  const { max, running, waiting, done, failed } = slots;
+  const all = [...(running||[]).map(n=>({n,s:'running'})),
+               ...(waiting||[]).map(n=>({n,s:'waiting'})),
+               ...(done||[]).map(n=>({n,s:'done'})),
+               ...(failed||[]).map(n=>({n,s:'failed'}))];
+  const cells = [];
+  for (let i = 0; i < max; i++) {
+    const item = all[i];
+    if (item) {
+      cells.push(`<div class="slot-cell slot-${item.s}" title="${esc(item.n)}">${esc(item.n.replace('agent-',''))}</div>`);
+    } else {
+      cells.push(`<div class="slot-cell slot-empty">·</div>`);
+    }
+  }
+  grid.innerHTML = cells.join('');
+  document.getElementById('slots').style.display = 'block';
+}
+
+// ── DAG 面板渲染 ─────────────────────────────────────────────────────
+function renderDag(dag) {
+  const grid = document.getElementById('dag-grid');
+  if (!grid || !dag || !dag.nodes) return;
+  const statusColor = {pass:'#238636',running:'#1f6feb',waiting:'#484f58',inject:'#e3b341',fail:'#da3633',verifying:'#58a6ff'};
+  const nodes = dag.nodes || [];
+  const edges = dag.edges || [];
+  const levelMap = {};
+  nodes.forEach(n => { levelMap[n.id] = 0; });
+  let changed = true;
+  while (changed) {
+    changed = false;
+    edges.forEach(([from, to]) => {
+      const nv = (levelMap[from]||0) + 1;
+      if (nv > (levelMap[to]||0)) { levelMap[to] = nv; changed = true; }
+    });
+  }
+  const maxLevel = Math.max(0, ...Object.values(levelMap));
+  const cols = Array.from({length: maxLevel+1}, ()=>[]);
+  nodes.forEach(n => cols[levelMap[n.id]||0].push(n));
+  let html = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
+  for (let l = 0; l <= maxLevel; l++) {
+    html += '<div style="display:flex;flex-direction:column;gap:8px">';
+    cols[l].forEach(n => {
+      const color = statusColor[n.status] || '#484f58';
+      const deps = (n.depends||[]).join(', ');
+      html += `<div class="dag-node" style="border-color:${color}" title="${deps?'依赖: '+deps:'无依赖'}">
+        <div class="dag-node-name">${esc(n.id.replace('agent-',''))}</div>
+        <div class="dag-node-status" style="color:${color}">${n.status||'waiting'}</div>
+      </div>`;
+    });
+    html += '</div>';
+    if (l < maxLevel) html += '<div style="font-size:20px;color:#484f58">→</div>';
+  }
+  html += '</div>';
+  grid.innerHTML = html;
+  document.getElementById('dag').style.display = 'block';
+}
 </script>
 </body>
 </html>"""
@@ -832,7 +948,16 @@ class Handler(BaseHTTPRequestHandler):
 
                 agents = [parse_log(p) for p in paths]
                 stats  = collect_stats(agents)
-                push({"type": "agents", "agents": agents, "stats": stats, "mode": mode})
+                # 读取 conductor 状态（slots + DAG），不存在时为 None（向后兼容）
+                conductor_state = read_conductor_state()
+                push({
+                    "type": "agents",
+                    "agents": agents,
+                    "stats": stats,
+                    "mode": mode,
+                    "slots": conductor_state["slots"] if conductor_state else None,
+                    "dag":   conductor_state["dag"]   if conductor_state else None,
+                })
 
                 if mode == "active" and stats["all_done"] and not STATE.ai_triggered:
                     with STATE.lock:
