@@ -834,8 +834,7 @@ class Conductor:
             self.passed.add(name)
             # 释放 slot
             proc = self.running_procs.pop(name, None)
-            if proc:
-                slot_num = len(self.running_procs) + 1
+            if proc is not None:
                 self._emit(
                     "SLOT_FREE",
                     f"agent={name} reason=pass total_running={len(self.running_procs)}",
@@ -943,7 +942,7 @@ class Conductor:
                         f"slot 已满 ({len(self.running_procs)}/{self.max_slots})，"
                         f"{name} 排队等待..."
                     )
-                    break  # 按拓扑顺序，这一个卡住了就不再检查后面的
+                    continue  # 不 break：继续检查后续 agent，避免误挡无依赖关系的任务
                 self._fork_agent(name)
                 self._write_state()
 

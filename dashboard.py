@@ -537,8 +537,8 @@ footer { text-align: center; padding: 8px; color: #30363d; font-size: 11px; }
   <div id="time-saved"></div>
 </header>
 <div id="idle-banner">⏸ 任务已完成，等待下次任务… 页面不失效</div>
-<div id="slots"><h3>🔄 Slot 状态栏</h3><div class="slot-row"><span class="slot-label">Slots:</span><div class="slot-grid" id="slot-grid"></div></div></div>
-<div id="dag"><h3>📋 DAG 依赖图</h3><div class="dag-grid" id="dag-grid"></div></div>
+<div id="slots" style="display:none"><h3>🔄 Slot 状态栏</h3><div class="slot-row"><span class="slot-label">Slots:</span><div class="slot-grid" id="slot-grid"></div></div></div>
+<div id="dag" style="display:none"><h3>📋 DAG 依赖图</h3><div class="dag-grid" id="dag-grid"></div></div>
 <div id="gantt"><h3>📊 时间线</h3><div id="gantt-rows"></div></div>
 <div id="agents"></div>
 <div id="ai-box">
@@ -802,19 +802,15 @@ connect();
 function renderSlots(slots) {
   const grid = document.getElementById('slot-grid');
   if (!grid || !slots) return;
-  const { max, running, waiting, done, failed } = slots;
-  const all = [...(running||[]).map(n=>({n,s:'running'})),
-               ...(waiting||[]).map(n=>({n,s:'waiting'})),
-               ...(done||[]).map(n=>({n,s:'done'})),
-               ...(failed||[]).map(n=>({n,s:'failed'}))];
+  const { max, running } = slots;
+  const runSet = new Set(running || []);
   const cells = [];
-  for (let i = 0; i < max; i++) {
-    const item = all[i];
-    if (item) {
-      cells.push(`<div class="slot-cell slot-${item.s}" title="${esc(item.n)}">${esc(item.n.replace('agent-',''))}</div>`);
-    } else {
-      cells.push(`<div class="slot-cell slot-empty">·</div>`);
-    }
+  // 先填 running（占用中的 slot），再填 empty
+  for (const n of (running || [])) {
+    cells.push(`<div class="slot-cell slot-running" title="${esc(n)}">${esc(n.replace('agent-',''))}</div>`);
+  }
+  for (let i = cells.length; i < max; i++) {
+    cells.push(`<div class="slot-cell slot-empty" title="空闲">·</div>`);
   }
   grid.innerHTML = cells.join('');
   document.getElementById('slots').style.display = 'block';
