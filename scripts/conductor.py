@@ -563,6 +563,9 @@ class Conductor:
         self.codex_model: str = codex_model
         self.codex_bin: str = codex_bin or os.path.expanduser("~/.npm-global/bin/codex")
         self.script_dir: str = script_dir
+        self.notify_sh: str = os.path.join(self.script_dir, "notify.sh")
+        self.gateway_port: str = str(tasks.get("gateway_port") or os.environ.get("WT_GATEWAY_PORT", "3000"))
+        self.session_key: str = tasks.get("session_key") or os.environ.get("WT_SESSION_KEY", "agent:main:main")
 
         self.agents_map: Dict[str, Dict] = {a["name"]: a for a in self.agents_cfg}
 
@@ -920,6 +923,7 @@ class Conductor:
                 self.await_human = f"agent={name} 已追问 {round_num} 轮仍未通过（{reason[:120]}），请指示"
                 self.status[name] = "inject"  # 保持 inject 状态，不标 fail
                 self._emit("AWAIT_HUMAN", self.await_human)
+                self._notify("await_human", self.await_human)
                 self._write_state()
                 # 不释放 slot，不 pop running_procs，保持现状等人类决策
             else:
@@ -993,6 +997,25 @@ class Conductor:
                 self._emit("MERGE_DONE", f"files={','.join(merged_files)} commit=nothing_to_commit")
         except Exception as e:
             self._emit("MERGE_ERROR", f"commit 失败: {e}")
+
+    # ── 事件回报（OpenClaw 生态集成）────────────────────────────────
+
+    def _notify(self, event: str, message: str) -> None:
+        """非阻塞调用 notify.sh，失败静默"""
+        if not os.path.isfile(self.notify_sh):
+            return
+        try:
+            env = os.environ.copy()
+            env["WT_GATEWAY_PORT"] = self.gateway_port
+            env["WT_SESSION_KEY"] = self.session_key
+            subprocess.Popen(
+                ["bash", self.notify_sh, event, message],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self._log(f"notify 失败（静默）: {e}")
 
     # ── 人类介入 ──────────────────────────────────────────────────────
 
@@ -1132,6 +1155,7 @@ action 含义：
                 self._emit("ERROR", f"agent={name} 上游依赖 {dep} 已失败，跳过")
                 self.status[name] = "fail"
                 self.failed.add(name)
+                self._notify("agent_fail", f"agent {name} 因上游 {dep} 失败而跳过")
                 return False
             if dep not in self.passed:
                 return False
@@ -1260,6 +1284,11 @@ action 含义：
             "CONDUCTOR_DONE",
             f"pass={pass_count} fail={fail_count} max_rounds={max_rounds} total_inject_rounds={total_rounds_sum} elapsed={elapsed}s",
         )
+
+        # OpenClaw 生态回报
+        self._notify("done", f"项目 {os.path.basename(self.repo)} 完成！{pass_count}/{n_agents} 通过，耗时 {elapsed}s。产出已合并到 main 分支。")
+        if fail_count > 0:
+            self._notify("agent_fail", f"项目 {os.path.basename(self.repo)} 完成，但 {fail_count} 个 agent 失败。详见展板 http://localhost:{self.dashboard_port}")
 
         # 写报告文件
         try:
