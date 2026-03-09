@@ -481,6 +481,8 @@ def write_state_file(
     waiting_set: Set[str],
     passed: Set[str],
     failed: Set[str],
+    await_human: Optional[str] = None,
+    paused: bool = False,
 ) -> None:
     """写 conductor 状态到 /tmp/wt-conductor-state.json，dashboard.py SSE 帧附带读取"""
     nodes = [
@@ -505,6 +507,8 @@ def write_state_file(
             "failed": sorted(failed),
         },
         "dag": {"nodes": nodes, "edges": edges},
+        "await_human": await_human,
+        "paused": paused,
         "updated_at": time.time(),
     }
     try:
@@ -580,6 +584,12 @@ class Conductor:
         # tasks.yaml 可用 max_inject_rounds 覆盖
         self.max_inject_rounds: int = int(tasks.get("max_inject_rounds") or 3)
 
+        self.llm_model: str = tasks.get("llm_model") or "gpt-4.1-mini"
+
+        self.await_human: Optional[str] = None   # 非 None 时表示等待人类输入，值为原因描述
+        self.human_input_file = "/tmp/wt-human-input.json"  # 展板写入，conductor 读取
+        self.paused: bool = False   # 全局暂停标志
+
         self.conductor_log = "/tmp/wt-conductor.log"
         self.conductor_report = "/tmp/wt-conductor-report.txt"
         self.start_time = time.time()
@@ -623,6 +633,8 @@ class Conductor:
             waiting_set=waiting_set,
             passed=self.passed,
             failed=self.failed,
+            await_human=self.await_human,
+            paused=self.paused,
         )
 
     # ── AGENT_DONE 检测 ───────────────────────────────────────────────
@@ -882,20 +894,12 @@ class Conductor:
             reason = "; ".join(all_failures[:3])
             # 检查 inject 轮次上限，防止 agent 无限追问占用 slot 卡死 DAG
             if round_num >= self.max_inject_rounds:
-                self._emit(
-                    "ERROR",
-                    f"agent={name} inject 超过上限 {self.max_inject_rounds} 轮，标记 fail 并释放 slot",
-                )
-                self.status[name] = "fail"
-                self.failed.add(name)
-                self.running_procs.pop(name, None)   # 释放 slot
-                # 终止仍在运行的子进程
-                proc = self.running_procs.get(name)
-                if proc and proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
+                # 超限 → 发 AWAIT_HUMAN，暂停等待人类指令
+                self.await_human = f"agent={name} 已追问 {round_num} 轮仍未通过（{reason[:120]}），请指示"
+                self.status[name] = "inject"  # 保持 inject 状态，不标 fail
+                self._emit("AWAIT_HUMAN", self.await_human)
+                self._write_state()
+                # 不释放 slot，不 pop running_procs，保持现状等人类决策
             else:
                 self._emit("INJECT", f"agent={name} round={round_num} reason={reason[:200]}")
                 self._write_inject(name, all_failures, round_num)
@@ -968,6 +972,135 @@ class Conductor:
         except Exception as e:
             self._emit("MERGE_ERROR", f"commit 失败: {e}")
 
+    # ── 人类介入 ──────────────────────────────────────────────────────
+
+    def _handle_human_input(self) -> None:
+        try:
+            with open(self.human_input_file, encoding="utf-8") as f:
+                data = json.load(f)
+            os.remove(self.human_input_file)
+        except Exception as e:
+            self._emit("ERROR", f"读取 human_input 失败: {e}")
+            return
+
+        text = data.get("text", "").strip()
+        if not text:
+            return
+
+        self._emit("HUMAN_INPUT", f"text={text[:100]}")
+
+        # 用 LLM 解读意图
+        intent = self._interpret_intent(text)
+        self._emit("HUMAN_INTENT", f"intent={intent.get('action')} target={intent.get('target','*')}")
+
+        action = intent.get("action", "unknown")
+        target = intent.get("target")   # agent name 或 None（全局）
+
+        if action == "pause":
+            self.paused = True
+            self.await_human = None
+            self._emit("PAUSED", "用户暂停")
+        elif action == "resume":
+            self.paused = False
+            self.await_human = None
+            self._emit("RESUMED", "用户恢复")
+        elif action == "skip" and target and target in self.status:
+            # 强制 pass 目标 agent，解锁下游
+            self.status[target] = "pass"
+            self.passed.add(target)
+            self.running_procs.pop(target, None)
+            self.await_human = None
+            unlocked = [a["name"] for a in self.agents_cfg
+                        if target in (a.get("depends") or []) and self.status[a["name"]] == "waiting"]
+            self._emit("SKIP", f"agent={target} → force_pass, unlocked={','.join(unlocked)}")
+        elif action == "retry" and target and target in self.status:
+            # 重置 agent 状态，重新 fork
+            self.status[target] = "waiting"
+            self.passed.discard(target)
+            self.running_procs.pop(target, None)
+            self.agent_rounds[target] = 0
+            self.await_human = None
+            self._emit("RETRY", f"agent={target} → reset to waiting")
+        elif action == "fail" and target and target in self.status:
+            self.status[target] = "fail"
+            self.failed.add(target)
+            self.running_procs.pop(target, None)
+            self.await_human = None
+            self._emit("FORCE_FAIL", f"agent={target} → force fail")
+        elif action == "extend" and target and target in self.status:
+            self.max_inject_rounds += 2
+            self.await_human = None
+            self._emit("EXTEND", f"agent={target} max_inject_rounds → {self.max_inject_rounds}")
+        else:
+            self._emit("HUMAN_UNRECOGNIZED", f"无法执行: {text[:80]}")
+
+        self._write_state()
+
+    def _interpret_intent(self, text: str) -> Dict:
+        if not self.openai_api_key or not self.openai_base_url:
+            return self._keyword_intent(text)
+
+        agent_names = list(self.agents_map.keys())
+        status_summary = {n: self.status[n] for n in agent_names}
+
+        system_prompt = """你是多Agent编程任务的调度助手。用户会用自然语言描述对当前任务的指令。
+你需要输出一个 JSON 对象（不要 markdown）：
+{"action": "pause|resume|skip|retry|fail|extend|unknown", "target": "agent名称或null", "reason": "一句话解释"}
+
+action 含义：
+- pause: 暂停调度
+- resume: 恢复调度
+- skip: 强制某agent通过（跳过验证，解锁下游）
+- retry: 重置某agent并重试
+- fail: 强制某agent失败
+- extend: 给某agent延长追问次数(+2轮)
+- unknown: 无法识别
+
+只输出 JSON。"""
+
+        user_prompt = f"当前状态：{json.dumps(status_summary, ensure_ascii=False)}\n可用agent：{agent_names}\n用户指令：{text}"
+
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({"model": self.llm_model, "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ], "temperature": 0.1}).encode()
+            req = _ur.Request(
+                self.openai_base_url.rstrip("/") + "/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.openai_api_key}"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+            content = body["choices"][0]["message"]["content"]
+            content = re.sub(r"```[a-z]*\n?", "", content).strip()
+            return json.loads(content)
+        except Exception as e:
+            self._emit("ERROR", f"LLM intent 解析失败: {e}")
+            return self._keyword_intent(text)
+
+    def _keyword_intent(self, text: str) -> Dict:
+        t = text.lower()
+        agent_names = list(self.agents_map.keys())
+        target = next((n for n in agent_names if n in t), None)
+        if any(w in t for w in ["暂停", "pause", "停一下", "停止"]):
+            return {"action": "pause", "target": None, "reason": "关键词"}
+        if any(w in t for w in ["恢复", "resume", "继续"]):
+            return {"action": "resume", "target": None, "reason": "关键词"}
+        if any(w in t for w in ["跳过", "skip", "放行", "强制pass"]):
+            return {"action": "skip", "target": target, "reason": "关键词"}
+        if any(w in t for w in ["重试", "retry", "重来", "重新"]):
+            return {"action": "retry", "target": target, "reason": "关键词"}
+        if any(w in t for w in ["失败", "fail", "放弃"]):
+            return {"action": "fail", "target": target, "reason": "关键词"}
+        if any(w in t for w in ["延长", "extend", "多试", "多几轮"]):
+            return {"action": "extend", "target": target, "reason": "关键词"}
+        return {"action": "unknown", "target": None, "reason": "无法识别"}
+
+    # ── 检查 agent 是否满足启动条件 ───────────────────────────────────
+
     def _can_start(self, name: str) -> bool:
         """检查 agent 的所有依赖是否已 pass；若有上游 fail 则直接传播 fail"""
         a = self.agents_map[name]
@@ -1014,6 +1147,16 @@ class Conductor:
         self._write_state()
 
         while True:
+            # ── 检查全局暂停 ──────────────────────────────────────────────
+            if self.paused and not self.await_human:
+                self._write_state()
+                time.sleep(self.poll_interval)
+                continue
+
+            # ── 检查人类输入 ──────────────────────────────────────────────
+            if os.path.isfile(self.human_input_file):
+                self._handle_human_input()
+
             # ── Step 1: 检查 running agents ────────────────────────────
             for name in list(self.running_procs.keys()):
                 if self.status[name] != "running":

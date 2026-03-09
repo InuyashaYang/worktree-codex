@@ -528,6 +528,36 @@ header h1 { font-size: 15px; color: #58a6ff; white-space: nowrap; }
 .dag-edge { height: 1px; background: #30363d; margin: 0 6px; flex-shrink: 0; }
 
 footer { text-align: center; padding: 8px; color: #30363d; font-size: 11px; }
+
+/* Human-in-the-loop 介入栏 */
+.human-bar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: #161b22; border-top: 1px solid #30363d;
+  padding: 10px 20px; z-index: 100;
+  transition: border-color 0.3s;
+}
+.human-bar.alert { border-top-color: #f0883e; }
+.human-bar-inner { max-width: 1200px; margin: 0 auto; }
+.human-prompt {
+  color: #f0883e; font-size: 13px; margin-bottom: 6px;
+  padding: 6px 10px; background: rgba(240,136,62,0.1);
+  border-radius: 6px; border-left: 3px solid #f0883e;
+}
+.human-input-row { display: flex; gap: 8px; }
+#human-input {
+  flex: 1; background: #0d1117; border: 1px solid #30363d;
+  color: #e6edf3; padding: 8px 12px; border-radius: 6px;
+  font-size: 14px; outline: none; transition: border-color 0.2s;
+}
+#human-input:focus { border-color: #388bfd; }
+#human-input.alert { border-color: #f0883e; }
+#human-send {
+  background: #238636; color: #fff; border: none;
+  padding: 8px 18px; border-radius: 6px; cursor: pointer;
+  font-size: 14px;
+}
+#human-send:hover { background: #2ea043; }
+body { padding-bottom: 70px; }
 </style>
 </head>
 <body>
@@ -563,6 +593,18 @@ footer { text-align: center; padding: 8px; color: #30363d; font-size: 11px; }
     <div id="log-modal-timeline" style="display:flex;flex-direction:column"></div>
     <div id="log-modal-shells"   style="display:none;flex-direction:column"></div>
     <div id="log-modal-body"     style="display:none"></div>
+  </div>
+</div>
+
+<div id="human-bar" class="human-bar">
+  <div class="human-bar-inner">
+    <div id="human-prompt" class="human-prompt" style="display:none"></div>
+    <div class="human-input-row">
+      <input id="human-input" type="text"
+             placeholder="任务进行中，可随时输入指令（如：跳过 agent-logic / 暂停 / 继续）..."
+             autocomplete="off">
+      <button id="human-send" onclick="sendHumanInput()">发送</button>
+    </div>
   </div>
 </div>
 
@@ -771,6 +813,23 @@ function connect() {
         const html = renderCard(a);
         if (ex) ex.outerHTML = html; else c.insertAdjacentHTML('beforeend', html);
       });
+      // await_human 高亮
+      const bar = document.getElementById('human-bar');
+      const prompt = document.getElementById('human-prompt');
+      const inp = document.getElementById('human-input');
+      if (data.await_human) {
+        bar.classList.add('alert');
+        prompt.style.display = 'block';
+        prompt.textContent = '⚠ ' + data.await_human;
+        inp.classList.add('alert');
+        inp.focus();
+        inp.placeholder = '请输入指令（如：跳过 / 重试 / 延长追问次数）...';
+      } else {
+        bar.classList.remove('alert');
+        prompt.style.display = 'none';
+        inp.classList.remove('alert');
+        inp.placeholder = '任务进行中，可随时输入指令（如：跳过 agent-logic / 暂停 / 继续）...';
+      }
     } else if (data.type === 'ai_waiting') {
       document.getElementById('ai-box').style.display = 'block';
       document.getElementById('ai-loading').style.display = 'block';
@@ -797,6 +856,29 @@ function connect() {
   };
 }
 connect();
+
+// ── 人类介入：输入框发送 ───────────────────────────────────────────
+function sendHumanInput() {
+  const input = document.getElementById('human-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.classList.remove('alert');
+  document.getElementById('human-bar').classList.remove('alert');
+  document.getElementById('human-prompt').style.display = 'none';
+  fetch('/api/human_input', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text}),
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) console.error('human_input error:', d.error);
+  });
+}
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('human-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendHumanInput();
+  });
+});
 
 // ── Slot 状态栏渲染 ──────────────────────────────────────────────────
 function renderSlots(slots) {
@@ -905,6 +987,19 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[dashboard] register: {log_path} (total={len(STATE.log_paths)})")
             self._send(200, "application/json",
                        json.dumps({"ok": True, "log": log_path, "total": len(STATE.log_paths)}).encode())
+
+        elif self.path == "/api/human_input":
+            try:
+                text = data.get("text", "").strip()
+                if text:
+                    with open("/tmp/wt-human-input.json", "w", encoding="utf-8") as f:
+                        json.dump({"text": text, "ts": time.time()}, f)
+                    self._json({"ok": True, "text": text})
+                else:
+                    self._json({"ok": False, "error": "empty"}, 400)
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 500)
+
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -914,6 +1009,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
+
+    def _json(self, data: dict, code: int = 200):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self._send(code, "application/json", body)
 
     def _sse(self):
         self.send_response(200)
@@ -955,6 +1054,8 @@ class Handler(BaseHTTPRequestHandler):
                     "stats": stats,
                     "slots": conductor_state["slots"] if conductor_state else None,
                     "dag":   conductor_state["dag"]   if conductor_state else None,
+                    "await_human": conductor_state.get("await_human") if conductor_state else None,
+                    "paused": conductor_state.get("paused", False) if conductor_state else False,
                 }
                 push_hash = _hl.md5(
                     json.dumps(push_payload, sort_keys=True, ensure_ascii=False).encode()
