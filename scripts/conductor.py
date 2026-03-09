@@ -588,16 +588,26 @@ class Conductor:
         self.llm_model: str = tasks.get("llm_model") or "gpt-4.1-mini"
 
         self.await_human: Optional[str] = None
-        self.human_input_file = "/tmp/wt-human-input.json"
         self.paused: bool = False
 
-        # ── per-project 隔离：用 repo 目录名做后缀，防止多项目冲突 ──
+        # ── run_id 命名空间：所有 IPC 文件集中在一个目录 ─────────────
         _proj = os.path.basename(self.repo.rstrip("/"))
-        self.project_id = _proj
-        self.conductor_log    = f"/tmp/wt-conductor-{_proj}.log"
-        self.conductor_report = f"/tmp/wt-conductor-{_proj}-report.txt"
-        self.conductor_state_file = f"/tmp/wt-conductor-{_proj}-state.json"
-        self.inject_prefix = f"/tmp/wt-inject-{_proj}-"   # + agentname + .txt
+        _ts   = time.strftime("%Y%m%d-%H%M%S")
+        self.run_id   = f"{_proj}-{_ts}"
+        self.run_dir  = f"/tmp/wt/{self.run_id}"
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        self.conductor_log        = f"{self.run_dir}/conductor.log"
+        self.conductor_report     = f"{self.run_dir}/conductor-report.txt"
+        self.conductor_state_file = f"{self.run_dir}/conductor-state.json"
+        self.human_input_file     = f"{self.run_dir}/human-input.json"
+        self.inject_prefix        = f"{self.run_dir}/inject-"   # + agentname + .txt
+
+        # 写 run_id 文件让外部工具（dashboard、shell）能找到最新 run
+        _latest = "/tmp/wt/latest-run-id"
+        os.makedirs("/tmp/wt", exist_ok=True)
+        with open(_latest, "w") as _f:
+            _f.write(self.run_id)
 
         self.start_time = time.time()
         self.topo_order: List[str] = []
@@ -653,7 +663,7 @@ class Conductor:
     def _check_agent_done(self, name: str) -> bool:
         """检查 log 中 baseline 之后是否出现新的 AGENT_DONE。检测到则更新 baseline。"""
         a = self.agents_map[name]
-        log_path = a.get("log", f"/tmp/wt-{name}.log")
+        log_path = a.get("log") or f"{self.run_dir}/agent-{name}.log"
         if not os.path.isfile(log_path):
             return False
         try:
@@ -767,7 +777,7 @@ class Conductor:
         a = self.agents_map[name]
         worktree = a.get("worktree", a.get("worktree_path", ""))
         branch = a.get("branch", f"feature/{name}")
-        log_path = a.get("log", f"/tmp/wt-{name}.log")
+        log_path = a.get("log") or f"{self.run_dir}/agent-{name}.log"
         prompt = a.get("prompt", "")
 
         # 替换上游占位符
@@ -791,15 +801,16 @@ class Conductor:
         env["OPENAI_API_KEY"] = self.openai_api_key or env.get("OPENAI_API_KEY", "")
         base_url_key = "OPENAI_BASE_URL"
         env[base_url_key] = self.openai_base_url or env.get(
-            base_url_key,            "http://152.53.52.170:3003/v1",
+            base_url_key, "http://152.53.52.170:3003/v1",
         )
         model_key = "CODEX_MODEL"
         env[model_key] = self.codex_model or env.get(model_key, "gpt-5.3-codex")
         bin_key = "CODEX_BIN"
         env[bin_key] = self.codex_bin or env.get(bin_key, "")
         env["DASHBOARD_PORT"] = str(self.dashboard_port)
-        # 把 prompt 通过环境变量传入，避免 shell 转义问题
         env["WT_TASK_PROMPT"] = prompt
+        # run_dir 命名空间：orchestrate.sh 用这个派生 inject/agent-log 路径
+        env["WT_RUN_DIR"] = self.run_dir
 
         # 准备日志目录
         os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)

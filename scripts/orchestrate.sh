@@ -152,9 +152,17 @@ TURN=1
 run_turn 1 "$INSTRUMENTED_PROMPT" || EXIT_CODE=$?
 emit "CODEX_EXIT" "code=$EXIT_CODE turn=1"
 
-# ── Conductor 注入文件路径 ────────────────────────────────────────────
-# conductor.sh 会把追问内容写到这个文件；orchestrate.sh 每轮检查并消费
-INJECT_FILE="/tmp/wt-inject-$(basename "$REPO_DIR")-${AGENT_NAME}.txt"
+# ── Conductor 注入文件路径（run_dir 命名空间，由 conductor 通过 WT_RUN_DIR 传入）──
+# WT_RUN_DIR 未设置时降级为旧格式，保持向后兼容
+if [ -n "${WT_RUN_DIR:-}" ]; then
+  INJECT_FILE="${WT_RUN_DIR}/inject-${AGENT_NAME}.txt"
+  # 同时把 agent log 移到 run_dir（如果外部传入的 LOG_FILE 不在 run_dir 里）
+  if [[ "$LOG_FILE" != "$WT_RUN_DIR"/* ]]; then
+    LOG_FILE="${WT_RUN_DIR}/agent-${AGENT_NAME}.log"
+  fi
+else
+  INJECT_FILE="/tmp/wt-inject-$(basename "$REPO_DIR")-${AGENT_NAME}.txt"
+fi
 
 # ── 后续轮：根据上一轮输出判断是否追问，同时监听 conductor 注入 ────────
 while [ "$TURN" -lt "$AGENT_MAX_TURNS" ]; do

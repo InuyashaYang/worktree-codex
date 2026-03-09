@@ -253,17 +253,32 @@ def collect_stats(agents):
 # conductor 状态读取（slots + DAG）
 # ──────────────────────────────────────────────
 
-_CONDUCTOR_STATE_FILE = "/tmp/wt-conductor-state.json"
+_CONDUCTOR_STATE_FILE = "/tmp/wt-conductor-state.json"     # 兼容旧路径
+_WT_LATEST_RUN_ID    = "/tmp/wt/latest-run-id"            # conductor 写入最新 run_id
+
+def _resolve_state_file() -> str:
+    """优先用 latest-run-id 定位 per-run state 文件，降级到兼容路径。"""
+    try:
+        if os.path.isfile(_WT_LATEST_RUN_ID):
+            run_id = open(_WT_LATEST_RUN_ID).read().strip()
+            p = f"/tmp/wt/{run_id}/conductor-state.json"
+            if os.path.isfile(p):
+                return p
+    except Exception:
+        pass
+    return _CONDUCTOR_STATE_FILE
 
 def read_conductor_state() -> dict:
     """
     读取 conductor.py 写入的状态文件。
+    先尝试最新 run_id 路径，再降级到兼容路径。
     文件不存在时返回 None（向后兼容），dashboard SSE 帧里 slots/dag 字段为 null。
     """
-    if not os.path.isfile(_CONDUCTOR_STATE_FILE):
+    p = _resolve_state_file()
+    if not os.path.isfile(p):
         return None
     try:
-        with open(_CONDUCTOR_STATE_FILE, encoding="utf-8") as f:
+        with open(p, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
