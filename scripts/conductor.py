@@ -542,8 +542,12 @@ class Conductor:
         # log 文件读取基线（行数），用于检测新的 AGENT_DONE
         self.log_baselines: Dict[str, int] = {}
 
-        # 每个 agent 的追问轮次
+        # 每个 agent 的追问轮次（inject 轮次，不含初始第1轮）
         self.agent_rounds: Dict[str, int] = {a["name"]: 0 for a in self.agents_cfg}
+
+        # inject 上限：超过则标 fail 释放 slot，防止 DAG 卡死
+        # tasks.yaml 可用 max_inject_rounds 覆盖
+        self.max_inject_rounds: int = int(tasks.get("max_inject_rounds") or 3)
 
         self.conductor_log = "/tmp/wt-conductor.log"
         self.conductor_report = "/tmp/wt-conductor-report.txt"
@@ -764,12 +768,6 @@ class Conductor:
 
         self._log(f"  fork: {bash_cmd[:120]}...")
 
-        slot_num = len(self.running_procs) + 1
-        self._emit(
-            "SLOT_ALLOC",
-            f"agent={name} slot={slot_num} total_running={slot_num}",
-        )
-
         # 初始化 log 基线（当前行数，以便后续只检测新行）
         if os.path.isfile(log_path):
             try:
@@ -786,12 +784,13 @@ class Conductor:
                 shell=True,
                 env=env,
             )
-            self.running_procs[name] = proc
+            self.running_procs[name] = proc   # 先 append
             self.status[name] = "running"
             self.agent_rounds[name] += 1
+            slot_num = len(self.running_procs)  # append 之后计数才准
             self._emit(
-                "AGENT_STARTED",
-                f"agent={name} pid={proc.pid} round={self.agent_rounds[name]}",
+                "SLOT_ALLOC",
+                f"agent={name} slot={slot_num} total_running={slot_num} pid={proc.pid} round={self.agent_rounds[name]}",
             )
         except Exception as e:
             self._emit("ERROR", f"fork 失败 agent={name}: {e}")
@@ -850,13 +849,30 @@ class Conductor:
         else:
             # ── 验证失败 ──
             reason = "; ".join(all_failures[:3])
-            self._emit("INJECT", f"agent={name} round={round_num} reason={reason[:200]}")
-            self._write_inject(name, all_failures, round_num)
-            self.status[name] = "inject"
-            self._emit(
-                "SLOT_FREE",
-                f"agent={name} reason=inject total_running={len(self.running_procs)} (slot保持占用等待追问)",
-            )
+            # 检查 inject 轮次上限，防止 agent 无限追问占用 slot 卡死 DAG
+            if round_num >= self.max_inject_rounds:
+                self._emit(
+                    "ERROR",
+                    f"agent={name} inject 超过上限 {self.max_inject_rounds} 轮，标记 fail 并释放 slot",
+                )
+                self.status[name] = "fail"
+                self.failed.add(name)
+                self.running_procs.pop(name, None)   # 释放 slot
+                # 终止仍在运行的子进程
+                proc = self.running_procs.get(name)
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                self._emit("INJECT", f"agent={name} round={round_num} reason={reason[:200]}")
+                self._write_inject(name, all_failures, round_num)
+                self.status[name] = "inject"
+                self._emit(
+                    "SLOT_FREE",
+                    f"agent={name} reason=inject total_running={len(self.running_procs)} (slot保持占用等待追问)",
+                )
 
         self._write_state()
 

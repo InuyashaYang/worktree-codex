@@ -927,9 +927,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(msg.encode())
             self.wfile.flush()
 
-        last_mode  = None
-        last_ping  = time.time()
-        PING_INTERVAL = 15  # 秒，前端超过 35s 没收到任何消息则重连
+        last_mode      = None
+        last_ping      = time.time()
+        last_push_hash = None   # 用于检测 agents 数据是否有变化
+        PING_INTERVAL  = 15     # 秒，前端超过 35s 没收到任何消息则重连
 
         try:
             while True:
@@ -940,20 +941,28 @@ class Handler(BaseHTTPRequestHandler):
 
                 if last_mode == "idle" and mode == "active":
                     push({"type": "reload"})
+                    last_push_hash = None   # 强制刷新
                 last_mode = mode
 
                 agents = [parse_log(p) for p in paths]
                 stats  = collect_stats(agents)
-                # 读取 conductor 状态（slots + DAG），不存在时为 None（向后兼容）
                 conductor_state = read_conductor_state()
-                push({
-                    "type": "agents",
+
+                # 计算本轮数据 hash，idle 模式下无变化则跳过推送（只推 ping）
+                import hashlib as _hl
+                push_payload = {
                     "agents": agents,
                     "stats": stats,
-                    "mode": mode,
                     "slots": conductor_state["slots"] if conductor_state else None,
                     "dag":   conductor_state["dag"]   if conductor_state else None,
-                })
+                }
+                push_hash = _hl.md5(
+                    json.dumps(push_payload, sort_keys=True, ensure_ascii=False).encode()
+                ).hexdigest()
+
+                if mode == "active" or push_hash != last_push_hash:
+                    push({"type": "agents", "mode": mode, **push_payload})
+                    last_push_hash = push_hash
 
                 if mode == "active" and stats["all_done"] and not STATE.ai_triggered:
                     with STATE.lock:
@@ -973,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
                     push({"type": "ping", "ts": int(now)})
                     last_ping = now
 
-                time.sleep(2 if mode == "idle" else 1)
+                time.sleep(3 if mode == "idle" else 1)
 
         except (BrokenPipeError, ConnectionResetError):
             pass
