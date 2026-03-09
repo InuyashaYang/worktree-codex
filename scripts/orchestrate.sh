@@ -154,7 +154,7 @@ emit "CODEX_EXIT" "code=$EXIT_CODE turn=1"
 
 # ── Conductor 注入文件路径 ────────────────────────────────────────────
 # conductor.sh 会把追问内容写到这个文件；orchestrate.sh 每轮检查并消费
-INJECT_FILE="/tmp/wt-inject-${AGENT_NAME}.txt"
+INJECT_FILE="/tmp/wt-inject-$(basename "$REPO_DIR")-${AGENT_NAME}.txt"
 
 # ── 后续轮：根据上一轮输出判断是否追问，同时监听 conductor 注入 ────────
 while [ "$TURN" -lt "$AGENT_MAX_TURNS" ]; do
@@ -232,3 +232,40 @@ fi
 rm -f "$LAST_MSG_FILE"
 emit "AGENT_DONE" "agent=$AGENT_NAME exit_code=$EXIT_CODE total_turns=$TURN"
 echo "AGENT_DONE:$AGENT_NAME" | tee -a "$LOG_FILE"
+
+# ── Conductor 注入等待（AGENT_DONE 后 conductor 可能写 inject 追问）────
+# 等待最多 30s，有 inject 文件则继续追问轮次
+INJECT_WAIT=0
+while [ "$INJECT_WAIT" -lt 30 ]; do
+  if [ -f "$INJECT_FILE" ] && [ -s "$INJECT_FILE" ]; then
+    INJECT_CONTENT=$(cat "$INJECT_FILE")
+    : > "$INJECT_FILE"
+    TURN=$((TURN + 1))
+    emit "INJECT_TURN" "turn=$TURN source=conductor_post_done inject_len=$(echo "$INJECT_CONTENT" | wc -c)"
+    run_turn "$TURN" "$INJECT_CONTENT" || EXIT_CODE=$?
+    emit "CODEX_EXIT" "code=$EXIT_CODE turn=$TURN source=inject_post_done"
+
+    # 快照新产出
+    DIFF_STAT=$(git diff HEAD~1 --stat 2>/dev/null | tail -1 || echo "no diff")
+    CHANGED_FILES=$(git diff HEAD~1 --name-only 2>/dev/null | tr '\n' ' ' || echo "")
+    emit "OUTCOME_DIFF"  "$DIFF_STAT"
+    emit "OUTCOME_FILES" "changed: $CHANGED_FILES"
+    emit "OUTCOME_EXIT"  "final_exit_code=$EXIT_CODE"
+
+    # 自动 commit 兜底
+    PENDING=$(git status --porcelain 2>/dev/null || echo "")
+    if [ -n "$PENDING" ]; then
+      git add -A
+      git commit -m "[${AGENT_NAME}] inject task complete (auto-commit)" --no-verify 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    emit "AGENT_DONE" "agent=$AGENT_NAME exit_code=$EXIT_CODE total_turns=$TURN"
+    echo "AGENT_DONE:$AGENT_NAME" | tee -a "$LOG_FILE"
+
+    # 重置等待计数器，再等下一轮 inject
+    INJECT_WAIT=0
+    continue
+  fi
+  sleep 1
+  INJECT_WAIT=$((INJECT_WAIT + 1))
+done

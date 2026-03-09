@@ -470,7 +470,7 @@ def contract_check(
 # 状态文件（供 dashboard.py 读取）
 # ─────────────────────────────────────────────────────────────────────
 
-STATE_FILE = "/tmp/wt-conductor-state.json"
+STATE_FILE = "/tmp/wt-conductor-state.json"   # 默认值，实际由 Conductor 实例覆盖
 
 
 def write_state_file(
@@ -483,8 +483,9 @@ def write_state_file(
     failed: Set[str],
     await_human: Optional[str] = None,
     paused: bool = False,
+    state_file: str = STATE_FILE,   # per-project 路径，由 Conductor 传入
 ) -> None:
-    """写 conductor 状态到 /tmp/wt-conductor-state.json，dashboard.py SSE 帧附带读取"""
+    """写 conductor 状态到状态文件，dashboard.py SSE 帧附带读取"""
     nodes = [
         {
             "id": a["name"],
@@ -512,7 +513,7 @@ def write_state_file(
         "updated_at": time.time(),
     }
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -586,12 +587,18 @@ class Conductor:
 
         self.llm_model: str = tasks.get("llm_model") or "gpt-4.1-mini"
 
-        self.await_human: Optional[str] = None   # 非 None 时表示等待人类输入，值为原因描述
-        self.human_input_file = "/tmp/wt-human-input.json"  # 展板写入，conductor 读取
-        self.paused: bool = False   # 全局暂停标志
+        self.await_human: Optional[str] = None
+        self.human_input_file = "/tmp/wt-human-input.json"
+        self.paused: bool = False
 
-        self.conductor_log = "/tmp/wt-conductor.log"
-        self.conductor_report = "/tmp/wt-conductor-report.txt"
+        # ── per-project 隔离：用 repo 目录名做后缀，防止多项目冲突 ──
+        _proj = os.path.basename(self.repo.rstrip("/"))
+        self.project_id = _proj
+        self.conductor_log    = f"/tmp/wt-conductor-{_proj}.log"
+        self.conductor_report = f"/tmp/wt-conductor-{_proj}-report.txt"
+        self.conductor_state_file = f"/tmp/wt-conductor-{_proj}-state.json"
+        self.inject_prefix = f"/tmp/wt-inject-{_proj}-"   # + agentname + .txt
+
         self.start_time = time.time()
         self.topo_order: List[str] = []
 
@@ -625,7 +632,7 @@ class Conductor:
             n for n, s in self.status.items()
             if s == "waiting"
         }
-        write_state_file(
+        kwargs = dict(
             agents_cfg=self.agents_cfg,
             status_map=self.status,
             max_slots=self.max_slots,
@@ -636,6 +643,10 @@ class Conductor:
             await_human=self.await_human,
             paused=self.paused,
         )
+        # per-project 独立状态文件（防多项目冲突）
+        write_state_file(**kwargs, state_file=self.conductor_state_file)
+        # 同时写兼容路径（dashboard 默认读这个）
+        write_state_file(**kwargs, state_file=STATE_FILE)
 
     # ── AGENT_DONE 检测 ───────────────────────────────────────────────
 
@@ -661,7 +672,7 @@ class Conductor:
 
     def _inject_consumed(self, name: str) -> bool:
         """文件不存在或为空 = 已被 orchestrate.sh 消费"""
-        inject_file = f"/tmp/wt-inject-{name}.txt"
+        inject_file = f"{self.inject_prefix}{name}.txt"
         if not os.path.isfile(inject_file):
             return True
         try:
@@ -739,7 +750,7 @@ class Conductor:
 
 请现在开始修复。
 """
-        inject_file = f"/tmp/wt-inject-{name}.txt"
+        inject_file = f"{self.inject_prefix}{name}.txt"
         try:
             with open(inject_file, "w", encoding="utf-8") as f:
                 f.write(inject_content)
