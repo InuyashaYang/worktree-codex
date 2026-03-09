@@ -2,184 +2,227 @@
 name: worktree-codex
 description: >
   使用 git worktree 隔离多个 Codex 实例，由 OpenClaw 主控器并行调度完成同一项目的不同编码模块。
-  适用场景：将一个编码项目拆分为独立子任务，让多个 Codex 实例并行实现，最后合并 PR。
+  适用场景：将一个编码项目拆分为独立子任务，让多个 Codex 实例并行实现，最后合并。
   触发条件：用户要求"多个 Codex 协作"、"并行编码"、"worktree 编码"、"多 Codex 编排"、"并行完成项目"时激活。
 ---
 
 # Worktree Codex — 多 Codex 并行编码技能
 
+## 架构分层
+
+```
+Layer 4 — 决策层       conductor.sh
+                        全局生命周期、Contract 验证、追问注入、终止判断
+Layer 3 — Agent 层     orchestrate.sh
+                        单 Agent 执行循环、注入监听、Codex session 管理
+Layer 2 — 基础设施层   setup_worktrees.sh / push_and_pr.sh
+                        lib/syntax.sh（可插拔语法检查）
+                        lib/contract.sh（CONTRACT 解析与注入 prompt 生成）
+Layer 1 — 可观测层     dashboard.py + launch.sh
+                        只读展示，SSE 推流，不介入决策
+```
+
+**层间通信协议：**
+- conductor → orchestrate：写 `/tmp/wt-inject-<name>.txt`（异步注入）
+- orchestrate → conductor：写 `##AGENT_DONE##` 到 log（被动轮询）
+- orchestrate → dashboard：写 `##标记##` 到 log（只追加，单向）
+- conductor → dashboard：`POST /reload`（通知新任务开始）
+
 ## 前提条件
 
-- Claude Code 二进制：`/mnt/c/Users/Inuyasha/.local/bin/claude.exe`（Windows 侧，可从 WSL 调用）
-- GitHub Token：从 `~/.openclaw/openclaw.json` 读取（`skills.entries["gh-issues"].apiKey`）
-- 目标 Git 仓库已存在（本地 + GitHub 远端）
+- Codex CLI：`~/.npm-global/bin/codex`（`npm install -g @openai/codex`）
+- `OPENAI_API_KEY` + `OPENAI_BASE_URL` 已配置（见 `~/.profile`）
+- 目标 Git 仓库已存在（本地）
 
-## 核心工作流（5 步）
+## 标准工作流（6 步）
 
-### 步骤 1：明确任务拆分
+### 步骤 1：写 CONTRACT.md（接口契约）
 
-在开始前，必须确定：
-- **每个 Agent 的任务**（1-3 个具体函数/文件）
-- **文件所有权**（每个文件只允许一个 Agent 写）
-- **并行 or 串行**（有依赖关系的任务需串行）
+在任务开始前，写好各 Agent 的接口约定，格式如下：
 
-详见 `references/task-decomposition.md`
+```markdown
+## Agent: agent-board
+Files: board.js, board.css
+Exports:
+- class ChessBoard
+- method initBoard
+- method highlightCell
+- method clearHighlights
+- method onCellClick
 
-### 步骤 2：创建 Worktree
+## Agent: agent-logic
+Files: logic.js
+Exports:
+- class ChessLogic
+- method getInitialBoard
+- method isValidMove
+- method applyMove
+- method isInCheck
+```
+
+CONTRACT 作用：
+1. 写入各 Agent 的 task prompt，Agent 知道自己必须实现什么
+2. conductor 用它做完成后的自动验证基准（grep 符号名）
+
+### 步骤 2：初始化仓库 + 创建 Worktree
 
 ```bash
-bash scripts/setup_worktrees.sh <repo_dir> <worktrees_base_dir> <agent-a> <agent-b> ...
+mkdir -p ~/projects/my-project && cd ~/projects/my-project
+git init && echo "# My Project" > README.md
+git add . && git commit -m "init"
+
+bash skills/worktree-codex/scripts/setup_worktrees.sh \
+  ~/projects/my-project \
+  ~/projects/my-project-worktrees \
+  agent-a agent-b agent-c
 ```
 
-输出格式：`agent_name:worktree_path:branch_name`（每行一个 Agent）
+输出：`agent_name:worktree_path:branch_name`（每行一个 Agent）
 
-### 步骤 3：并行启动 Codex
-
-用 exec(background=true) 并行启动多个 Agent，每个调用：
+### 步骤 3：启动展板
 
 ```bash
-OPENAI_API_KEY="<key>" \
-OPENAI_BASE_URL="http://YOUR_PROXY_HOST:PORT/v1" \
-CODEX_MODEL="gpt-5.3-codex" \
-bash scripts/orchestrate.sh \
-  <repo_dir> \
-  <agent_name> \
-  <worktree_path> \
-  <branch> \
-  "<task_prompt>" \
-  /tmp/<agent_name>.log
-
-# 注意：orchestrate.sh 默认使用 --full-auto（sandbox=workspace-write）
-# 如需完全无沙箱，设 CODEX_EXTRA_FLAGS="--dangerously-bypass-approvals-and-sandbox"
-```
-
-Task prompt 模板：
-```
-你是 <AgentName>，只能修改 <file1>, <file2>，不得碰其他文件。
-任务：<具体实现要求，含函数签名、异常处理、docstring>
-
-**可解释性协议（必须遵守）：**
-在执行过程中，在关键节点输出以下格式的标记行（独立成行）：
-
-  ##INTENT## 我接下来要做什么，以及为什么
-  ##OBSTACLE## 遇到了什么预期外的问题
-  ##DECISION## 我选择了方案X而不是方案Y，原因是Z
-  ##RESULT## 最终完成了什么，核心改动是什么（一句话）
-
-要求：每个主要阶段至少一个 ##INTENT##，遇到问题必须输出 ##OBSTACLE##，完成时必须输出 ##RESULT##。
-完成后执行：git add -A && git commit -m "[<AgentName>] task complete"
-```
-
-### 步骤 4：启动展板（可选但推荐）
-
-展板是**任务生命周期绑定**的，不是常驻服务：
-
-```
-任务启动 → active 模式：SSE 实时推送，1秒刷新
-任务完成 → idle 模式：页面保持不失效，停止轮询，显示"等待下次任务"
-下次任务 → orchestrate.sh 自动 POST /reload → 恢复 active
-```
-
-用 `launch.sh` 一键启动（推荐）：
-
-```bash
-# 用自建代理做 AI 分析
 bash skills/worktree-codex/scripts/launch.sh \
-  --llm-base-url http://YOUR_PROXY_HOST:PORT/v1 \
+  --port 7789 \
+  --llm-base-url http://152.53.52.170:3003/v1 \
   --llm-api-key sk-xxx \
   --llm-model gpt-4.1-mini \
   --bg --open
 
-# 用 OpenRouter（key 自动从 openclaw.json 读）
-bash skills/worktree-codex/scripts/launch.sh \
-  --llm-model google/gemini-flash-1.5:free \
-  --bg --open
-
-# 禁用 AI 分析（纯展板）
-bash skills/worktree-codex/scripts/launch.sh --no-ai --bg --open
+# 随时查地址：
+cat /tmp/wt-dashboard.url
+bash skills/worktree-codex/scripts/launch.sh --find
 ```
 
-**launch.sh 参数速查：**
-- `--port <PORT>` — 端口，默认 7789
-- `--llm-base-url` / `--llm-api-key` / `--llm-model` — AI 分析 LLM 配置
-- `--no-ai` — 禁用 AI 分析
-- `--bg` — 后台运行，PID 写入 `/tmp/wt-dashboard-<port>.pid`
-- `--open` — 启动后自动打开浏览器
+### 步骤 4：并行启动各 Agent（后台）
 
-之后每次 `orchestrate.sh` 启动时会自动调用 `/reload`，无需手动操作。
-手动激活新任务也可以：
+每个 Agent 调用一次 `orchestrate.sh`，后台运行：
 
 ```bash
-curl -X POST http://localhost:7789/reload \
-  -H 'Content-Type: application/json' \
-  -d '{"logs":["/tmp/agent-a.log","/tmp/agent-b.log"]}'
+OPENAI_API_KEY="sk-xxx" OPENAI_BASE_URL="http://BASE/v1" \
+DASHBOARD_PORT=7789 \
+bash skills/worktree-codex/scripts/orchestrate.sh \
+  <repo_dir> <agent_name> <worktree_path> <branch> \
+  "<task_prompt>" /tmp/<agent>.log &
 ```
 
-展板功能：
-- 每个 agent 状态卡（waiting/running/done/failed）+ 进度条 + 实时 token 计数
-- idle 模式下页面不失效，数据保持可读
-- 所有 agent 完成后，LLM 自动效率分析（模型/端点可配置，不可用时静默跳过）
+orchestrate.sh 在每轮 Codex 执行后，会检查 `/tmp/wt-inject-<agent>.txt`。若 conductor 注入了追问，自动启动新的 Codex turn 处理。
 
-### 步骤 5：监控 + 收尾
+**Task prompt 模板（推荐）：**
+```
+你是 <AgentName>，只能创建和修改 <文件列表>，不得碰其他文件。
 
-使用 `process(poll)` 等待所有 Agent 完成，然后检查：
+任务：<具体实现要求>
 
-```bash
-cat /tmp/<agent_name>.log | grep "AGENT_DONE"
+接口契约（必须严格导出）：
+<CONTRACT 对应 Agent 块的内容>
+
+完成后 git add -A && git commit -m "[<AgentName>] task complete"
 ```
 
-如果 Agent 没有自行 commit（常见于第一次），脚本会自动收尾。
-
-### 步骤 5：推送 PR + 合并
+### 步骤 5：启动 conductor（主控轮询，接管全局生命周期）
 
 ```bash
-bash scripts/push_and_pr.sh \
+OPENAI_API_KEY="sk-xxx" OPENAI_BASE_URL="http://BASE/v1" \
+bash skills/worktree-codex/scripts/conductor.sh \
+  --repo <repo_dir> \
+  --contract <contract_file> \
+  --agents "name:worktree:branch:logfile name2:worktree2:branch2:logfile2" \
+  --max-global-rounds 3 \
+  --poll-interval 15 \
+  --syntax-check "node --check" \
+  --dashboard-port 7789
+```
+
+**conductor 工作阶段：**
+```
+Phase 0：等待所有 Agent 首轮 AGENT_DONE（超时 30min）
+Phase 1：集成验证
+  ├─ 语法检查（syntax-check 命令逐文件）
+  └─ CONTRACT 验证（grep 符号名，验证导出存在）
+Phase 2：对失败 Agent 写入追问注入
+  └─ /tmp/wt-inject-<name>.txt（内容：失败原因+契约要求+文件摘要）
+Phase 3：等待追问完成（超时 15min）→ 回 Phase 1
+Phase 4：输出报告 /tmp/wt-conductor-report.txt
+```
+
+### 步骤 6：合并 + 推 PR（可选）
+
+```bash
+cd <repo_dir>
+git merge <branch-a> --no-edit
+git merge <branch-b> --no-edit
+git merge <branch-c> --no-edit
+
+# 推 GitHub PR（需要 GH_TOKEN）
+bash skills/worktree-codex/scripts/push_and_pr.sh \
   <repo_dir> <gh_token> <owner/repo> <agent_name> <worktree_path> <branch> main
 ```
 
-验证通过后通过 GitHub API 合并：
+## 环境变量速查
 
-```bash
-curl -s -X PUT \
-  -H "Authorization: Bearer $GH_TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/<owner/repo>/pulls/<pr_number>/merge" \
-  -d '{"merge_method": "squash"}'
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `OPENAI_API_KEY` | 无（必填） | API Key |
+| `OPENAI_BASE_URL` | `http://152.53.52.170:3003/v1` | 代理地址 |
+| `CODEX_MODEL` | `gpt-5.3-codex` | Codex 模型 |
+| `CODEX_BIN` | `~/.npm-global/bin/codex` | Codex 二进制 |
+| `AGENT_MAX_TURNS` | `3` | 单 Agent 最大追问轮数 |
+| `DASHBOARD_PORT` | `7789` | 展板端口 |
+
+## conductor.sh 参数速查
+
+```
+--repo <dir>              目标 Git 仓库目录
+--contract <file>         CONTRACT.md 路径
+--agents "<spec>..."      空格分隔，每项: name:worktree:branch:logfile
+--max-global-rounds <N>   全局最大追问轮数（默认 5）
+--poll-interval <S>       轮询间隔秒数（默认 10）
+--syntax-check "<cmd>"    语法检查命令前缀，如 "node --check"
+--dashboard-port <PORT>   展板端口（默认 7789）
 ```
 
-## 已知限制与解决方案
+## launch.sh 参数速查
 
-**WSL 写文件被沙盒阻止**
-→ Claude Code 必须加 `--dangerously-skip-permissions`
-
-**Codex `.cmd` 在 WSL 下无法运行**
-→ 使用 `--dangerously-skip-permissions` 的 Claude Code 替代，或在 WSL 安装原生 codex：`npm install -g @openai/codex`
-
-**主仓库 git pull 权限错误（NTFS）**
-→ worktree 放在 WSL 本地文件系统（`~/projects/worktrees/`），不放 `/mnt/c/`
-
-**Agent 没有自行 commit**
-→ `orchestrate.sh` 脚本会检测未提交变更并自动 commit
-
-## 环境变量获取
-
-```bash
-CLAUDE_BIN="/mnt/c/Users/Inuyasha/.local/bin/claude.exe"
-GH_TOKEN=$(cat ~/.openclaw/openclaw.json | jq -r '.skills.entries["gh-issues"].apiKey')
+```
+--port <PORT>             展板端口（默认 7789）
+--llm-base-url <URL>      AI 分析 LLM base URL
+--llm-api-key <KEY>       AI 分析 LLM API Key
+--llm-model <MODEL>       AI 分析模型（默认 gpt-4.1-mini）
+--no-ai                   禁用 AI 分析
+--bg                      后台运行
+--open                    启动后自动打开浏览器
+--find                    查找运行中的展板
+--stop                    停止展板
 ```
 
-## 模型选择与限制
+## 已知限制
 
-**⚠️ 核心限制：Codex CLI 只能用实现了 `/v1/responses` 端点的后端。**
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| Codex 只支持 `/v1/responses` 端点 | OpenAI 专有格式 | 只用 `gpt-5.x-codex` 系列 |
+| worktree 不能放 `/mnt/c/` | NTFS 文件锁 | 放 WSL 本地 `~/projects/` |
+| Agent 间通信 | 各自独立 session | 通过 CONTRACT 对齐接口，conductor 做集成验证 |
+| 合并冲突 | 文件所有权分配不清 | CONTRACT 里明确每个文件只属于一个 Agent |
 
-自建代理（`http://YOUR_PROXY_HOST:PORT/v1`）只对 OpenAI 原生模型路由 `/responses`，deepseek / gemini / qwen 等全部 404。OpenRouter 同样不支持 `/responses`。
+## 文件结构
 
-**结论：目前只有 `gpt-5.x-codex` 系列可用。**
-
-| 模型 | `/responses` | 说明 |
-|------|-------------|------|
-| `gpt-5.3-codex` | ✅ | 默认，推荐 |
-| `gpt-4.1-mini` | ✅（待验证） | 轻量 |
-| `deepseek-v3` | ❌ 404 | 代理未路由 |
-| `gemini-2.5-flash` | ❌ 挂起 | 代理未路由 |
-| OpenRouter 任意模型 | ❌ 401 | 不支持端点 |
+```
+skills/worktree-codex/
+├── SKILL.md                    # 本文件
+├── dashboard.py                # 可观测层（展板服务）
+├── requirements.txt            # dashboard 依赖
+├── scripts/
+│   ├── conductor.sh            # Layer 4：决策层（主控轮询）
+│   ├── orchestrate.sh          # Layer 3：Agent 执行层
+│   ├── launch.sh               # Layer 1：展板启动入口
+│   ├── setup_worktrees.sh      # Layer 2：worktree 隔离
+│   ├── push_and_pr.sh          # Layer 2：PR 推送
+│   └── lib/
+│       ├── syntax.sh           # Layer 2：可插拔语法检查
+│       └── contract.sh         # Layer 2：CONTRACT 解析与注入 prompt 生成
+└── references/
+    ├── DESIGN.md               # 完整设计文档（含取舍说明）
+    ├── CONTRACT.md             # CONTRACT 模板（含示例）
+    └── task-decomposition.md   # 任务拆分指南
+```

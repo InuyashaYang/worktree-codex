@@ -138,7 +138,17 @@ if [[ $BG -eq 1 ]]; then
   nohup "${CMD[@]}" > "/tmp/wt-dashboard-$PORT.log" 2>&1 &
   NEW_PID=$!
   echo $NEW_PID > "$PID_FILE"
-  echo "[launch] 后台运行 PID=$NEW_PID  cat $URL_FILE 随时查地址"
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║  展板已在后台启动"
+  echo "║  URL  : $DASHBOARD_URL"
+  echo "║  PORT : $PORT"
+  echo "║  PID  : $NEW_PID"
+  echo "║  LOG  : /tmp/wt-dashboard-$PORT.log"
+  echo "║"
+  echo "║  查找展板: launch.sh --find"
+  echo "║  停止展板: launch.sh --stop"
+  echo "╚══════════════════════════════════════════════════════════╝"
 else
   # 前台运行：退出时清理 URL 文件
   trap "rm -f '$URL_FILE' '$PID_FILE'" EXIT

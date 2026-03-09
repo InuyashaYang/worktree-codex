@@ -12,7 +12,12 @@ worktree-codex 实时监控展板 v1.1
 
 import argparse, glob, json, os, re, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """每个请求用独立线程，防止 LLM 调用阻塞整个服务器"""
+    daemon_threads = True
 
 # ──────────────────────────────────────────────
 # 全局状态
@@ -396,7 +401,7 @@ header h1 { font-size: 15px; color: #58a6ff; white-space: nowrap; }
 .card.failed  { border-color: #da3633; }
 .card-header  { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
 .card-name    { font-size: 14px; font-weight: bold; color: #e6edf3; }
-.card-meta    { font-size: 11px; color: #8b949e; margin-bottom: 6px; }
+.card-meta    { font-size: 11px; color: #8b949e; margin-bottom: 6px; line-height: 1.6; }
 .progress-bar { height: 3px; background: #30363d; border-radius: 2px; overflow: hidden; margin-bottom: 8px; }
 .progress-fill { height: 100%; border-radius: 2px; transition: width .5s; }
 .fill-running { background: #1f6feb; animation: pulse 1.5s infinite; }
@@ -415,8 +420,8 @@ header h1 { font-size: 15px; color: #58a6ff; white-space: nowrap; }
 .chip-eff    { color: #58a6ff; }
 
 /* Intent Trail */
-.trail-box     { margin: 6px 0 4px; border-left: 2px solid #30363d; padding-left: 8px; display: flex; flex-direction: column; gap: 3px; max-height: 110px; overflow-y: auto; }
-.trail-row     { font-size: 11px; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trail-box     { margin: 6px 0 4px; border-left: 2px solid #30363d; padding-left: 8px; display: flex; flex-direction: column; gap: 5px; max-height: 130px; overflow-y: auto; }
+.trail-row     { font-size: 11px; line-height: 1.6; white-space: normal; overflow: hidden; text-overflow: ellipsis; word-break: break-all; }
 .trail-goal    { color: #58a6ff; }
 .trail-intent  { color: #c9d1d9; }
 .trail-obstacle{ color: #d29922; }
@@ -907,7 +912,7 @@ def main():
     print(f"[dashboard] ✅ 展板已启动: {URL}")
     print(f"[dashboard] 地址文件:    {URL_FILE}  (cat 随时查)")
 
-    server = HTTPServer(("", args.port), Handler)
+    server = ThreadingHTTPServer(("", args.port), Handler)
     try:
         server.serve_forever()
     finally:

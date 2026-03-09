@@ -247,8 +247,101 @@ GIT_ASKPASS="$ASKPASS_SCRIPT" git push origin "$BRANCH"
 
 ## 五、当前未覆盖的场景（已知 Gap）
 
-1. **Agent 间通信** — A 的输出作为 B 的输入，目前需要手动串行
+1. **Agent 间通信** — A 的输出作为 B 的输入，目前需要手动串行（conductor 的 Phase 0 等待全员完成后再做验证，解决了"等所有人都跑完再对齐"的问题，但尚不支持 A 的产物直接作为 B 的输入 prompt）
 2. **动态任务分配** — 某个 Agent 完成后自动认领下一个任务，目前静态分配
 3. **合并冲突处理** — push_and_pr.sh 创建 PR 后，冲突需要人工解决
 4. **历史对比** — 多次运行的 token/速度趋势，展板每次重启清空
 5. **Claude Code 支持完整性** — orchestrate.sh 主要为 Codex 设计，Claude Code 的参数略有不同（`--dangerously-skip-permissions` vs `--full-auto`）
+6. **conductor 与展板集成** — conductor 日志（`/tmp/wt-conductor.log`）目前不注册到 dashboard.py，无法可视化追问轮次
+
+---
+
+## 六、主控轮询架构（conductor）
+
+### 6.1 设计动机
+
+worktree-codex v1 里，多个 Agent 并行跑完就完事了——没有验证每个 Agent 的输出是否满足接口约定，也没有机制在验证失败后自动追问修复。
+
+"集成"阶段的问题往往在 PR 合并时才暴露（符号名拼错、文件没生成、接口不匹配），这时候 Codex session 已经结束，需要人工再次启动。
+
+conductor 解决的核心问题：**让主控在所有 Agent 首轮跑完后，自动验证接口约定，对失败 Agent 注入追问，驱动多轮修复，无需人工介入。**
+
+### 6.2 组件关系
+
+```
+用户
+ │
+ ├─ conductor.sh          ← 主控轮询器（新增）
+ │   ├─ Phase 0: 等待所有 Agent AGENT_DONE
+ │   ├─ Phase 1: 语法检查 + CONTRACT 符号验证
+ │   ├─ Phase 2: 写追问到 /tmp/wt-inject-<name>.txt
+ │   ├─ Phase 3: 等待追问完成 → 回 Phase 1
+ │   └─ Phase 4: 输出 /tmp/wt-conductor-report.txt
+ │
+ └─ orchestrate.sh        ← 改造：增加注入监听
+     └─ 每轮结束检查 /tmp/wt-inject-<name>.txt
+         ├─ 有内容 → emit INJECT_TURN → run_turn(inject_prompt) → 清除文件
+         └─ 无内容 → 原有逻辑（RESULT+COMMIT 检查 / 自动追问）
+```
+
+### 6.3 CONTRACT 格式与解析
+
+CONTRACT.md 是纯 Markdown，供 conductor 用 awk/sed/grep 解析，无需 jq 或 Python。
+
+**格式：**
+```markdown
+## Agent: agent-name
+Files: file1.js, file2.css
+Exports:
+- class ClassName
+- method methodName
+- function funcName
+```
+
+**解析逻辑：**
+- `awk` 提取 `## Agent: <name>` 块内的 `Files:` 行和 `Exports:` 行
+- `- <kind> <symbol>` 格式中取最后一个词作为符号名
+- `grep -q <symbol> <file>` 验证符号在对应文件中存在（简单字符串匹配）
+
+### 6.4 追问注入机制
+
+orchestrate.sh 的主循环每轮结束后，先检查注入文件再做原有判断：
+
+```
+turn 1: 主任务
+loop:
+  ┌─ 检查 /tmp/wt-inject-<name>.txt
+  │   有内容 → run inject turn → 清除文件 → continue
+  │   无内容 ↓
+  ├─ RESULT + COMMIT 满足 → break
+  ├─ turn < MAX_TURNS → 自动追问 → continue
+  └─ break
+```
+
+注入文件由 conductor Phase 2 写入，包含：失败原因 + CONTRACT 要求 + 当前文件内容摘要（前60行）。
+
+### 6.5 日志标记（conductor）
+
+```
+##CONDUCTOR_START##    启动时写入
+##PHASE## 0|1|2|3|4   各阶段入口
+##AGENT_STATUS## agent=xxx status=waiting|done|failed|pass|retry
+##CHECK_RESULT## agent=xxx syntax=ok|fail contract=ok|fail
+##INJECT## agent=xxx round=N reason=...
+##CONDUCTOR_DONE## agents_pass=N agents_fail=M total_rounds=K
+```
+
+orchestrate.sh 新增：
+```
+##INJECT_TURN##        conductor 注入轮开始
+```
+
+### 6.6 设计取舍
+
+| 取舍点 | 选择 | 理由 |
+|--------|------|------|
+| 符号验证方式 | grep 字符串匹配 | 不依赖 AST 解析，零依赖，适用于 JS/Python/Bash 等多语言 |
+| 注入通信方式 | 临时文件 `/tmp/wt-inject-*.txt` | conductor 和 orchestrate 是独立进程，文件是最简单的 IPC |
+| 等待机制 | 轮询 log 文件行数 | AGENT_DONE 是结构化标记，稳定可靠；避免进程间 pipe |
+| 追问超时 | Phase 0 超时 30min，Phase 3 超时 15min | 追问任务应比初始任务快，给更短的窗口 |
+| CONTRACT 格式 | Markdown + awk 解析 | 人类可读，AI 可直接生成，无需 JSON/YAML schema |
