@@ -402,21 +402,32 @@ def contract_check(
     block = ct[block_start: block_start + next_m.start() if next_m else len(ct)]
 
     exports_m = re.search(r"^Exports:\s*\n((?:^- .*\n?)*)", block, re.MULTILINE)
-    if not exports_m:
-        return True, []
-
     symbols = []
-    for line in exports_m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith("- "):
-            parts = line[2:].split()
-            if parts:
-                symbols.append(parts[-1])
+    if exports_m:
+        for line in exports_m.group(1).splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                parts = line[2:].split()
+                if parts:
+                    symbols.append(parts[-1])
 
-    if not symbols:
+    # CSS Classes 验证（class 名需出现在 .css/.html 文件中）
+    css_m = re.search(r"^CSS Classes[^:]*:\s*\n((?:^- .*\n?)*)", block, re.MULTILINE)
+    css_classes = []
+    if css_m:
+        for line in css_m.group(1).splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                cls = line[2:].strip()
+                if cls:
+                    css_classes.append(cls)
+
+    if not symbols and not css_classes:
         return True, []
 
     failures = []
+
+    # 验证 JS exports
     for sym in symbols:
         found = False
         for fname in files:
@@ -431,6 +442,26 @@ def contract_check(
                 pass
         if not found:
             failures.append(f"CONTRACT_FAIL: {sym} (未在 {files} 中找到)")
+
+    # 验证 CSS classes（在 .css 或 .html 文件里查找 .classname 或 class="classname"）
+    css_files = [f for f in files if f.endswith(".css") or f.endswith(".html")]
+    for cls in css_classes:
+        found = False
+        for fname in css_files:
+            fpath = os.path.join(worktree, fname.strip())
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                content = Path(fpath).read_text(encoding="utf-8", errors="replace")
+                # 匹配 .classname { 或 class="... classname ..."
+                if (f".{cls}" in content or f'"{cls}"' in content
+                        or f"'{cls}'" in content or f" {cls} " in content):
+                    found = True
+                    break
+            except Exception:
+                pass
+        if not found and css_files:
+            failures.append(f"CSS_FAIL: .{cls} (未在 {css_files} 中找到)")
 
     return (len(failures) == 0), failures
 
@@ -878,6 +909,65 @@ class Conductor:
 
     # ── 检查 agent 是否满足启动条件 ───────────────────────────────────
 
+    def _merge_to_main(self) -> None:
+        """
+        精准合并：把每个 pass agent 的目标文件从 worktree checkout 到 main。
+        不做 git merge（避免共享文件冲突），只精准复制目标文件。
+        完成后在 main 做一次 commit。
+        """
+        import shutil
+
+        self._emit("MERGE_START", f"agents={','.join(sorted(self.passed))}")
+        repo = self.repo
+        merged_files: List[str] = []
+        errors: List[str] = []
+
+        for name in self.topo_order:
+            if name not in self.passed:
+                continue
+            a = self.agents_map[name]
+            worktree = a.get("worktree", "")
+            files: List[str] = a.get("files") or []
+            if not worktree or not files:
+                continue
+            for fname in files:
+                src = os.path.join(worktree, fname)
+                dst = os.path.join(repo, fname)
+                if not os.path.isfile(src):
+                    errors.append(f"{name}/{fname}: 文件不存在")
+                    continue
+                # 确保目标目录存在
+                os.makedirs(os.path.dirname(dst), exist_ok=True) if os.path.dirname(dst) else None
+                try:
+                    shutil.copy2(src, dst)
+                    merged_files.append(fname)
+                except Exception as e:
+                    errors.append(f"{name}/{fname}: 复制失败 {e}")
+
+        if errors:
+            for err in errors:
+                self._emit("MERGE_WARN", err)
+
+        if not merged_files:
+            self._emit("MERGE_SKIP", "没有文件需要合并")
+            return
+
+        # 在 main 做一次 commit
+        try:
+            agent_list = ",".join(sorted(self.passed))
+            result = subprocess.run(
+                f"cd {repo!r} && git add -A && "
+                f"git commit -m 'merge: {agent_list}' --no-verify",
+                shell=True, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                self._emit("MERGE_DONE", f"files={','.join(merged_files)} commit=ok")
+            else:
+                # 可能 nothing to commit（文件内容和 main 一致）
+                self._emit("MERGE_DONE", f"files={','.join(merged_files)} commit=nothing_to_commit")
+        except Exception as e:
+            self._emit("MERGE_ERROR", f"commit 失败: {e}")
+
     def _can_start(self, name: str) -> bool:
         """检查 agent 的所有依赖是否已 pass；若有上游 fail 则直接传播 fail"""
         a = self.agents_map[name]
@@ -988,6 +1078,10 @@ class Conductor:
 
             self._write_state()
             time.sleep(self.poll_interval)
+
+        # ── 精准文件合并到 main ────────────────────────────────────────
+        if self.passed:
+            self._merge_to_main()
 
         # ── 生成报告 ──────────────────────────────────────────────────
         elapsed = round(time.time() - self.start_time, 1)

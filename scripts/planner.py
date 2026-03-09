@@ -724,8 +724,12 @@ def main() -> None:
         "--tasks", tasks_path,
         "--max-slots", str(args.max_slots),
     ]
+    if args.openai_api_key:
+        conductor_cmd += ["--openai-api-key", args.openai_api_key]
+    if args.openai_base_url:
+        conductor_cmd += ["--openai-base-url", args.openai_base_url]
     if args.codex_model:
-        conductor_cmd += ["--model", args.codex_model]
+        conductor_cmd += ["--codex-model", args.codex_model]
     if args.codex_bin:
         conductor_cmd += ["--codex-bin", args.codex_bin]
 
