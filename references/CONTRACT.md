@@ -18,6 +18,21 @@
 # - 以 "#" 开头的行（本说明区）会被 awk 跳过（awk 只匹配 "^## Agent:" 开头）
 # - Files/Exports 行必须顶格写（无缩进），"-" 项也必须顶格
 # ══════════════════════════════════════════════════════════════════════
+#
+# ──────────────────────────────────────────────────────────────────────
+# ⚠ DataFormat 段（强制要求，每个涉及跨 Agent 数据结构的 CONTRACT 必须填写）
+#
+# 教训来源：两次多 Agent 棋盘项目中，engine/logic Agent 用 pieces[row][col]，
+#           而 board/ui Agent 用 pieces[col][row]，导致棋子完全无法选取。
+#           根因：数据格式约定只在 prompt 里口头说，没有写进 CONTRACT 强制对齐。
+#
+# 规则：
+# 1. 所有 Agent 间传递的数据结构，必须在 DataFormat 段里明确描述
+# 2. DataFormat 段写在 "## Global:" 块里，所有 Agent 均须遵守
+# 3. 任何涉及多维数组索引顺序（row/col）、坐标系原点、枚举值拼写的内容
+#    都必须在此处写清楚，不能依赖 Agent 自行猜测
+# 4. 各 Agent 的 task prompt 必须原文引用 DataFormat 段的对应内容
+# ──────────────────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────────────────
 # 示例项目：chess-game（国际象棋游戏）
@@ -27,6 +42,12 @@
 #   agent-board → 负责 DOM 棋盘渲染（board.js, board.css）
 #   agent-logic → 负责游戏规则和状态机（logic.js）
 # ──────────────────────────────────────────────────────────────────────
+
+## Global:
+DataFormat:
+- pieces: 二维数组，索引顺序为 pieces[row][col]，row 0 为棋盘顶部（黑方底线），row 7 为底部（白方底线），col 0 为 a 列，col 7 为 h 列
+- piece: null 或 { type: string, side: string }，type 为 K/Q/R/B/N/P，side 为 "white" 或 "black"（全小写）
+- 坐标原点：左上角 (col=0, row=0)
 
 ## Agent: agent-board
 Files: board.js, board.css

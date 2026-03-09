@@ -7,30 +7,23 @@
 #   launch.sh --stop          停止当前运行的展板实例
 #
 # 选项:
-#   --port <PORT>           展板端口，默认 7789
+#   --port <PORT>           期望端口，默认 7789（固定常驻端口）
+#                           端口占用策略：
+#                             - 被自家展板（dashboard.py）占用 → kill 旧实例，原地重启
+#                             - 被其他进程占用 → 自动顺延找下一个空闲端口
 #   --logs <glob/path>...   初始 log 文件（可 glob，可多个），后续 agent 自动注册
-#   --llm-base-url <URL>    AI 分析 base URL，默认 http://YOUR_PROXY_HOST:PORT/v1（自建代理）
-#   --llm-api-key <KEY>     AI 分析 API Key，默认从环境变量 OPENAI_API_KEY 读取
-#   --llm-model <MODEL>     AI 分析模型，默认 gemini-2.5-flash；多模态用 qwen3-30b-vl
+#   --llm-base-url <URL>    AI 分析 base URL
+#   --llm-api-key <KEY>     AI 分析 API Key
+#   --llm-model <MODEL>     AI 分析模型，默认 gpt-4.1-mini
 #   --no-ai                 禁用 AI 分析
 #   --bg                    后台运行（不阻塞终端）
 #   --open                  启动后自动打开浏览器
 #
-# 启动后 URL 写入 /tmp/wt-dashboard.url（固定路径，无论用哪个端口）
+# 启动后 URL 写入 /tmp/wt-dashboard.url（固定路径，无论实际端口）
 # 任何时候 cat /tmp/wt-dashboard.url 即可找到展板地址
 #
-# 示例（默认配置，直接用自建代理 gemini-2.5-flash）:
+# 示例（默认配置）:
 #   launch.sh --bg --open
-#
-# 示例（多模态分析任务）:
-#   launch.sh --llm-model qwen3-30b-vl --bg --open
-#
-# 示例（用 OpenRouter）:
-#   launch.sh \
-#     --llm-base-url https://openrouter.ai/api/v1 \
-#     --llm-api-key sk-or-xxx \
-#     --llm-model stepfun/step-3.5-flash:free \
-#     --bg --open
 #
 # 示例（禁用 AI 分析，纯展板）:
 #   launch.sh --no-ai --bg
@@ -39,9 +32,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DASHBOARD_PY="$SCRIPT_DIR/../dashboard.py"
-URL_FILE="/tmp/wt-dashboard.url"   # 固定路径，任何时候 cat 都能找到
+URL_FILE="/tmp/wt-dashboard.url"
+PID_FILE="/tmp/wt-dashboard.pid"
 
-PORT=7789
+PREFERRED_PORT=7789
 LOGS=()
 LLM_BASE_URL=""
 LLM_API_KEY=""
@@ -54,8 +48,6 @@ OPEN_BROWSER=0
 if [[ "${1:-}" == "--find" ]]; then
   if [[ -f "$URL_FILE" ]]; then
     URL=$(cat "$URL_FILE")
-    # 验证进程还活着
-    PID_FILE="/tmp/wt-dashboard.pid"
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "✅ 展板运行中: $URL  (PID=$(cat $PID_FILE))"
     else
@@ -70,7 +62,6 @@ if [[ "${1:-}" == "--find" ]]; then
 fi
 
 if [[ "${1:-}" == "--stop" ]]; then
-  PID_FILE="/tmp/wt-dashboard.pid"
   if [[ -f "$PID_FILE" ]]; then
     PID=$(cat "$PID_FILE")
     kill "$PID" 2>/dev/null && echo "✅ 已停止 PID=$PID" || echo "⚠ 进程已不存在"
@@ -85,7 +76,7 @@ fi
 # ── 解析参数 ────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)        PORT="$2"; shift 2 ;;
+    --port)        PREFERRED_PORT="$2"; shift 2 ;;
     --logs)
       shift
       while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
@@ -106,6 +97,61 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ── 端口占用策略 ─────────────────────────────────────────────────────
+# 1. 若 PID_FILE 存在且进程活着 → 直接 kill（是自家展板，占用合法，原地重启）
+# 2. 若 PREFERRED_PORT 被非自家进程占用 → 顺延找下一个空闲端口（最多尝试 20 个）
+# 3. 端口空闲 → 直接用
+
+resolve_port() {
+  local want="$PREFERRED_PORT"
+
+  # 先干掉已有的自家展板实例（无论端口是否一致）
+  if [[ -f "$PID_FILE" ]]; then
+    local old_pid
+    old_pid=$(cat "$PID_FILE")
+    if kill -0 "$old_pid" 2>/dev/null; then
+      echo "[launch] 停止旧展板实例 PID=$old_pid" >&2
+      kill "$old_pid" 2>/dev/null || true
+      sleep 0.4
+    fi
+    rm -f "$PID_FILE"
+  fi
+
+  # 检查期望端口是否空闲
+  local port="$want"
+  local tried=0
+  while [[ $tried -lt 20 ]]; do
+    if ! ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+       ! lsof -i ":${port}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      echo "$port"
+      return 0
+    fi
+
+    # 端口被占，判断是否是 dashboard.py
+    local occupier
+    occupier=$(lsof -i ":${port}" -sTCP:LISTEN -c python3 -t 2>/dev/null || true)
+    if [[ -n "$occupier" ]]; then
+      local cmd_check
+      cmd_check=$(ps -p "$occupier" -o args= 2>/dev/null || true)
+      if echo "$cmd_check" | grep -q "dashboard.py"; then
+        echo "[launch] 端口 $port 被旧展板占用 (PID=$occupier)，正在停止..." >&2
+        kill "$occupier" 2>/dev/null || true
+        sleep 0.5
+        echo "$port"
+        return 0
+      fi
+    fi
+
+    echo "[launch] 端口 $port 被其他进程占用，尝试 $((port+1))..." >&2
+    port=$((port + 1))
+    tried=$((tried + 1))
+  done
+
+  echo "$port"
+}
+
+PORT=$(resolve_port)
+
 # ── 组装 python 命令 ────────────────────────────────
 CMD=(python3 "$DASHBOARD_PY" --port "$PORT")
 
@@ -116,26 +162,17 @@ CMD=(python3 "$DASHBOARD_PY" --port "$PORT")
 [[ $NO_AI -eq 1       ]] && CMD+=(--no-ai)
 
 DASHBOARD_URL="http://localhost:$PORT"
-echo "[launch] 展板地址: $DASHBOARD_URL"
-echo "$DASHBOARD_URL" > "$URL_FILE"   # 写入固定路径
+echo "$DASHBOARD_URL" > "$URL_FILE"
 
-# ── 启动 ────────────────────────────────────────────
+# ── 自动打开浏览器 ───────────────────────────────────
 if [[ $OPEN_BROWSER -eq 1 ]]; then
   (sleep 1 && cmd.exe /c start "$DASHBOARD_URL" 2>/dev/null || \
               xdg-open "$DASHBOARD_URL" 2>/dev/null || true) &
 fi
 
-PID_FILE="/tmp/wt-dashboard.pid"
-
+# ── 启动 ─────────────────────────────────────────────
 if [[ $BG -eq 1 ]]; then
-  # 若已有实例在跑，先杀掉
-  if [[ -f "$PID_FILE" ]]; then
-    OLD_PID=$(cat "$PID_FILE")
-    kill "$OLD_PID" 2>/dev/null || true
-    rm -f "$PID_FILE"
-    sleep 0.3
-  fi
-  nohup "${CMD[@]}" > "/tmp/wt-dashboard-$PORT.log" 2>&1 &
+  nohup "${CMD[@]}" > "/tmp/wt-dashboard-${PORT}.log" 2>&1 &
   NEW_PID=$!
   echo $NEW_PID > "$PID_FILE"
   echo ""
@@ -143,15 +180,18 @@ if [[ $BG -eq 1 ]]; then
   echo "║  展板已在后台启动"
   echo "║  URL  : $DASHBOARD_URL"
   echo "║  PORT : $PORT"
+  if [[ "$PORT" != "$PREFERRED_PORT" ]]; then
+  echo "║  ⚠ 期望端口 $PREFERRED_PORT 被占用，已改用 $PORT"
+  fi
   echo "║  PID  : $NEW_PID"
-  echo "║  LOG  : /tmp/wt-dashboard-$PORT.log"
+  echo "║  LOG  : /tmp/wt-dashboard-${PORT}.log"
   echo "║"
   echo "║  查找展板: launch.sh --find"
   echo "║  停止展板: launch.sh --stop"
   echo "╚══════════════════════════════════════════════════════════╝"
 else
-  # 前台运行：退出时清理 URL 文件
   trap "rm -f '$URL_FILE' '$PID_FILE'" EXIT
   echo $$ > "$PID_FILE"
+  echo "[launch] 展板地址: $DASHBOARD_URL (前台运行，Ctrl+C 退出)"
   "${CMD[@]}"
 fi
